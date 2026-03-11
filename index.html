@@ -520,6 +520,91 @@
       padding: 16px 0;
     }
 
+    /* ── MobileNet Internals ──────────────────────────────── */
+    #internals-card {
+      background: white; border-radius: 14px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    #internals-card h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 0;
+      display: flex; align-items: center; gap: 8px;
+      cursor: pointer; user-select: none;
+    }
+    #internals-card h3:hover { color: #667eea; }
+    .internals-toggle {
+      margin-left: auto; font-size: 0.7rem;
+      background: #f0f4f8; border: 1px solid #e2e8f0;
+      border-radius: 4px; padding: 2px 7px; color: #718096;
+      cursor: pointer; transition: all 0.2s;
+    }
+    #internals-card h3:hover .internals-toggle { background:#ebf4ff; border-color:#667eea; color:#667eea; }
+
+    #internals-body { margin-top: 14px; }
+
+    .internals-subtitle {
+      font-size: 0.78rem; color: #718096; margin-bottom: 14px; line-height: 1.5;
+    }
+
+    /* 4-stage flow */
+    .internals-flow {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .int-stage {
+      display: flex; flex-direction: column; align-items: center; gap: 5px;
+    }
+    .int-stage-label {
+      font-size: 0.64rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      color: #4a5568; text-align: center; line-height: 1.2;
+    }
+    .int-stage-layer {
+      font-size: 0.6rem; color: #a0aec0; text-align: center;
+      font-family: monospace; margin-bottom: 2px;
+    }
+    .int-canvas {
+      width: 100%; aspect-ratio: 1;
+      border-radius: 6px; border: 1.5px solid #e2e8f0;
+      image-rendering: pixelated; background: #1a202c;
+    }
+    .int-canvas.active-int { border-color: #9f7aea; box-shadow: 0 0 0 2px rgba(159,122,234,0.2); }
+    .int-stage-desc {
+      font-size: 0.62rem; color: #718096; text-align: center;
+      line-height: 1.3; min-height: 26px;
+    }
+
+    /* depth arrow between stages */
+    .int-arrow {
+      display: flex; align-items: center; justify-content: center;
+      color: #cbd5e0; font-size: 1rem; padding-top: 28px;
+      /* not used as grid item — arrows are between columns */
+    }
+
+    /* channel count badge on each canvas */
+    .int-badge {
+      font-size: 0.6rem; background: rgba(0,0,0,0.55); color: white;
+      border-radius: 3px; padding: 1px 5px; font-family: monospace;
+      margin-top: -2px;
+    }
+
+    /* insight row below the 4 panels */
+    #internalsInsight {
+      padding: 9px 12px;
+      background: #faf5ff; border: 1px solid #e9d8fd;
+      border-radius: 8px; font-size: 0.78rem; color: #553c9a;
+      line-height: 1.6;
+    }
+
+    /* idle overlay on canvases before live starts */
+    .int-idle-text {
+      font-size: 0.65rem; color: #a0aec0; text-align: center;
+      padding: 6px 0; font-style: italic;
+    }
+
     /* ── Responsive ───────────────────────────────────────── */
     @media(max-width: 860px) {
       main { grid-template-columns: 1fr; }
@@ -754,6 +839,68 @@
     <div id="arch-card">
       <h3>🧱 Network Architecture &nbsp;<span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— what's inside your classifier</span></h3>
       <div id="arch-svg"></div>
+    </div>
+
+    <!-- MobileNet Internals Visualiser -->
+    <div id="internals-card">
+      <h3 id="internalsToggleBtn">
+        🧬 MobileNet Internals
+        <span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— inside the frozen feature extractor</span>
+        <span class="internals-toggle" id="internalsToggleLabel">▼ expand</span>
+      </h3>
+
+      <div id="internals-body" style="display:none;">
+        <div class="internals-subtitle">
+          Watch how MobileNet transforms your image through 28 layers — from raw pixels to abstract 1024D features.
+          Each panel shows the <b>mean channel activation</b> at that layer depth. 
+          <span style="color:#667eea;">Blue = low activation</span> · <span style="color:#f56565;">Red = high activation</span>
+        </div>
+
+        <div class="internals-flow">
+
+          <!-- Stage 1: Early conv — edges -->
+          <div class="int-stage" id="int-stage-1">
+            <div class="int-stage-label">① Early Conv</div>
+            <div class="int-stage-layer" id="int-layer-1">conv_pw_1_relu</div>
+            <canvas class="int-canvas" id="int-canvas-1" width="56" height="56"></canvas>
+            <div class="int-badge" id="int-badge-1">32ch · 112×112</div>
+            <div class="int-stage-desc">Detects <b>edges</b>, corners &amp; colour gradients — the most basic features</div>
+          </div>
+
+          <!-- Stage 2: Mid-early — textures -->
+          <div class="int-stage" id="int-stage-2">
+            <div class="int-stage-label">② Mid Conv</div>
+            <div class="int-stage-layer" id="int-layer-2">conv_pw_5_relu</div>
+            <canvas class="int-canvas" id="int-canvas-2" width="56" height="56"></canvas>
+            <div class="int-badge" id="int-badge-2">128ch · 28×28</div>
+            <div class="int-stage-desc">Detects <b>textures</b> — skin, fabric, patterns, surfaces</div>
+          </div>
+
+          <!-- Stage 3: Deep — object parts -->
+          <div class="int-stage" id="int-stage-3">
+            <div class="int-stage-label">③ Deep Conv</div>
+            <div class="int-stage-layer" id="int-layer-3">conv_pw_9_relu</div>
+            <canvas class="int-canvas" id="int-canvas-3" width="56" height="56"></canvas>
+            <div class="int-badge" id="int-badge-3">256ch · 14×14</div>
+            <div class="int-stage-desc">Detects <b>object parts</b> — faces, hands, wheels, edges of objects</div>
+          </div>
+
+          <!-- Stage 4: Last conv — spatial attention map -->
+          <div class="int-stage" id="int-stage-4">
+            <div class="int-stage-label">④ Last Conv</div>
+            <div class="int-stage-layer" id="int-layer-4">conv_pw_13_relu</div>
+            <canvas class="int-canvas" id="int-canvas-4" width="56" height="56"></canvas>
+            <div class="int-badge" id="int-badge-4">1024ch · 7×7</div>
+            <div class="int-stage-desc">Detects <b>whole objects</b> — collapses to the 1024D embedding via global avg pool</div>
+          </div>
+
+        </div>
+
+        <!-- Live insight row -->
+        <div id="internalsInsight">
+          Start Live Prediction — this panel will show what MobileNet activates at each depth of the network in real time.
+        </div>
+      </div>
     </div>
 
     <!-- Embedding distance -->

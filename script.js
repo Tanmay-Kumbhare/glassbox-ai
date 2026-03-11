@@ -1121,23 +1121,51 @@ offCanvas.width = offCanvas.height = 224;
 const offCtx = offCanvas.getContext('2d');
 
 // ── Spatial sub-model for GradCAM (built once after MobileNet loads) ──
-let spatialModel = null;   // outputs [1,7,7,1024] last conv feature map
+let spatialModel    = null;   // conv_pw_13 — [1,7,7,1024]
+let internalModels  = [];     // [{model, layerName, stageIdx}] — 4 depth stages
 
 function buildSpatialModel() {
   try {
-    const base       = mobilenetModel.model;
+    const base = mobilenetModel.model;
     if (!base || !base.layers) return;
-    // Find last conv layer before global avg pool — conv_pw_13_relu in MobileNet v1
     const layerNames = base.layers.map(l => l.name);
-    const targetName = layerNames.find(n =>
-      n.includes('conv_pw_13_relu') || n.includes('conv_pw_13')
-    ) || layerNames.find(n => n.includes('conv_pw_') && !n.includes('conv_pw_1_'));
-    if (!targetName) return;
-    spatialModel = tf.model({
-      inputs:  base.inputs,
-      outputs: base.getLayer(targetName).output
+
+    // ── GradCAM spatial model (last conv) ────────────────────
+    const lastConvName = layerNames.find(n => n.includes('conv_pw_13_relu'))
+                      || layerNames.find(n => n.includes('conv_pw_13'));
+    if (lastConvName) {
+      spatialModel = tf.model({ inputs: base.inputs, outputs: base.getLayer(lastConvName).output });
+    }
+
+    // ── MobileNet Internals: 4 depth stages ──────────────────
+    // We target 4 layers that represent progressively deeper processing.
+    // MobileNet v1 has 14 pointwise conv blocks (conv_pw_1 … conv_pw_13).
+    // We pick: pw_1 (very early), pw_5 (mid), pw_9 (deep), pw_13 (last).
+    // For each, fall back gracefully if the exact name isn't present.
+    const stageCandidates = [
+      ['conv_pw_1_relu', 'conv_pw_1', 'conv_dw_1_relu', 'conv1_relu'],
+      ['conv_pw_5_relu', 'conv_pw_5', 'conv_dw_5_relu'],
+      ['conv_pw_9_relu', 'conv_pw_9', 'conv_dw_9_relu'],
+      ['conv_pw_13_relu','conv_pw_13','conv_dw_13_relu'],
+    ];
+
+    internalModels = [];
+    stageCandidates.forEach((candidates, i) => {
+      const found = candidates.find(c => layerNames.includes(c));
+      if (!found) return;
+      try {
+        const m = tf.model({ inputs: base.inputs, outputs: base.getLayer(found).output });
+        internalModels.push({ model: m, layerName: found, stageIdx: i + 1 });
+        // Update layer name label in HTML
+        const lbl = document.getElementById(`int-layer-${i + 1}`);
+        if (lbl) lbl.textContent = found;
+      } catch(_) {}
     });
-  } catch(e) { spatialModel = null; }
+
+  } catch(e) {
+    spatialModel   = null;
+    internalModels = [];
+  }
 }
 
 async function runInspector(softmaxProbs) {
@@ -1182,10 +1210,15 @@ async function runInspector(softmaxProbs) {
     // ── GradCAM-lite: spatial feature map ───────────────────
     if (spatialModel) {
       spatial           = spatialModel.predict(normBatch);   // [1,7,7,1024]
-      const spatData    = await spatial.data();              // Float32 [7*7*1024]
+      const spatData    = await spatial.data();
       const [,fH,fW,fC] = spatial.shape;
       spatial.dispose();
       drawGradCAMOverlay(spatData, fH, fW, fC);
+    }
+
+    // ── MobileNet Internals: 4 depth stages ─────────────────
+    if (internalsVisible && internalModels.length > 0) {
+      await runInternals(normBatch);
     }
 
     normBatch.dispose();
@@ -1700,4 +1733,174 @@ function syncReplayButtons() {
     replayUseUpload.disabled = !(preview.src && preview.naturalWidth > 0);
   if (replaySnap)
     replaySnap.disabled = !webcamReady;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🧬 MOBILENET INTERNALS VISUALISER
+//
+//  HOW IT WORKS:
+//  At 4 depths of MobileNet we extract the feature map tensor
+//  [1, H, W, C] — a spatial grid of C-channel activations.
+//
+//  To visualise: compute channel-mean across all C channels per
+//  spatial cell → get a single [H, W] scalar map → ReLU (keep
+//  positives only) → normalise 0..1 → render as thermal heatmap
+//  (black→blue→cyan→green→yellow→red) at native resolution
+//  upsampled to 56×56 display canvas.
+//
+//  Layer depths used:
+//   Stage 1 — conv_pw_1_relu  → [1,112,112,32]   very early, edges
+//   Stage 2 — conv_pw_5_relu  → [1, 28, 28,128]  textures
+//   Stage 3 — conv_pw_9_relu  → [1, 14, 14,256]  object parts
+//   Stage 4 — conv_pw_13_relu → [1,  7,  7,1024] whole objects
+//
+//  Only runs when the card is expanded (internalsVisible=true).
+//  Uses the same normBatch already computed by runInspector.
+//  Each stage costs ~5ms GPU — total ~20ms per frame at 5fps.
+// ═══════════════════════════════════════════════════════════════
+
+let internalsVisible = false;
+
+// Toggle expand / collapse
+document.getElementById('internalsToggleBtn').addEventListener('click', () => {
+  internalsVisible = !internalsVisible;
+  const body  = document.getElementById('internals-body');
+  const label = document.getElementById('internalsToggleLabel');
+  body.style.display   = internalsVisible ? 'block' : 'none';
+  label.textContent    = internalsVisible ? '▲ collapse' : '▼ expand';
+});
+
+// Canvas refs for 4 stages — grabbed once
+const intCanvases = [1,2,3,4].map(i => document.getElementById(`int-canvas-${i}`));
+const intCtxs     = intCanvases.map(c => c ? c.getContext('2d') : null);
+const intBadges   = [1,2,3,4].map(i => document.getElementById(`int-badge-${i}`));
+const internalsInsight = document.getElementById('internalsInsight');
+
+// Thermal colourmap: black → blue → cyan → green → yellow → red
+// t in [0,1] → [r,g,b] in [0,255]
+function thermalColor(t) {
+  // 5 stops: 0=black, 0.25=blue, 0.5=cyan, 0.75=yellow, 1=red
+  let r, g, b;
+  if (t < 0.25) {
+    const s = t / 0.25;
+    r = 0; g = 0; b = Math.round(s * 255);
+  } else if (t < 0.5) {
+    const s = (t - 0.25) / 0.25;
+    r = 0; g = Math.round(s * 255); b = 255;
+  } else if (t < 0.75) {
+    const s = (t - 0.5) / 0.25;
+    r = Math.round(s * 255); g = 255; b = Math.round((1 - s) * 255);
+  } else {
+    const s = (t - 0.75) / 0.25;
+    r = 255; g = Math.round((1 - s) * 255); b = 0;
+  }
+  return [r, g, b];
+}
+
+// Draw a [H,W] Float32Array as a thermal heatmap on a canvas ctx
+function drawHeatmap(ctx, canvas, heatmap, fH, fW) {
+  // Normalise
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < heatmap.length; i++) {
+    if (heatmap[i] < mn) mn = heatmap[i];
+    if (heatmap[i] > mx) mx = heatmap[i];
+  }
+  const range = mx - mn || 1;
+
+  const imgData = ctx.createImageData(fW, fH);
+  for (let i = 0; i < fH * fW; i++) {
+    const t = (heatmap[i] - mn) / range;
+    const [r,g,b] = thermalColor(t);
+    imgData.data[i*4]   = r;
+    imgData.data[i*4+1] = g;
+    imgData.data[i*4+2] = b;
+    imgData.data[i*4+3] = 255;
+  }
+  ctx.putImageData(imgData, 0, 0);
+
+  // Upscale to display canvas using smoothing
+  // We need a temp canvas at fW×fH, then drawImage with smoothing to 56×56
+  const tmp = document.createElement('canvas');
+  tmp.width  = fW; tmp.height = fH;
+  tmp.getContext('2d').putImageData(imgData, 0, 0);
+
+  canvas.width  = 56; canvas.height = 56;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(tmp, 0, 0, 56, 56);
+}
+
+// Peak activation stat — tells the learner what to look for
+function describeActivation(heatmap, stageIdx) {
+  let sum = 0, max = 0, maxPos = 0;
+  for (let i = 0; i < heatmap.length; i++) {
+    sum += heatmap[i];
+    if (heatmap[i] > max) { max = heatmap[i]; maxPos = i; }
+  }
+  const mean   = sum / heatmap.length;
+  const spread = (max > 0 ? mean / max : 0);  // low = sparse activation, high = diffuse
+
+  if (spread < 0.2) return 'sparse — a few specific regions activated strongly';
+  if (spread < 0.5) return 'focused — moderate regions activated';
+  return 'diffuse — the whole image is activating this layer';
+}
+
+async function runInternals(normBatch) {
+  // normBatch is [1,224,224,3] already computed in runInspector
+  // We predict through each of the 4 stage models in sequence
+  const stats = [];
+
+  for (let s = 0; s < internalModels.length; s++) {
+    const { model, layerName, stageIdx } = internalModels[s];
+    const ctx    = intCtxs[stageIdx - 1];
+    const canvas = intCanvases[stageIdx - 1];
+    if (!ctx || !canvas) continue;
+
+    let feat;
+    try {
+      feat = model.predict(normBatch);       // [1, H, W, C]
+      const data     = await feat.data();    // Float32Array [H*W*C]
+      const [, fH, fW, fC] = feat.shape;
+      feat.dispose();
+
+      // Update badge: channels × spatial
+      if (intBadges[stageIdx - 1]) {
+        intBadges[stageIdx - 1].textContent = `${fC}ch · ${fH}×${fW}`;
+      }
+
+      // Channel-mean: sum across C channels per spatial cell
+      const heatmap = new Float32Array(fH * fW);
+      for (let row = 0; row < fH; row++) {
+        for (let col = 0; col < fW; col++) {
+          let sum = 0;
+          const base = (row * fW + col) * fC;
+          for (let c = 0; c < fC; c++) sum += Math.max(0, data[base + c]); // ReLU
+          heatmap[row * fW + col] = sum / fC;
+        }
+      }
+
+      drawHeatmap(ctx, canvas, heatmap, fH, fW);
+
+      // Highlight active state
+      canvas.classList.add('active-int');
+
+      stats.push({ stageIdx, fH, fW, fC, desc: describeActivation(heatmap, stageIdx), layerName });
+
+    } catch(e) {
+      if (feat && !feat.isDisposed) feat.dispose();
+    }
+  }
+
+  // Update insight sentence
+  if (stats.length > 0 && internalsInsight) {
+    const s1 = stats.find(s => s.stageIdx === 1);
+    const s4 = stats.find(s => s.stageIdx === 4);
+    const earlyDesc = s1 ? s1.desc : '—';
+    const deepDesc  = s4 ? s4.desc : '—';
+    internalsInsight.innerHTML =
+      `🔍 <b>Early layer (${s1?.layerName || 'conv1'}):</b> ${earlyDesc}. &nbsp;` +
+      `<b>Deep layer (${s4?.layerName || 'conv13'}):</b> ${deepDesc}. ` +
+      `As depth increases the spatial resolution shrinks but the feature complexity grows — ` +
+      `from edges to objects.`;
+  }
 }
