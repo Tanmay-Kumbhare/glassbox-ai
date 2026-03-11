@@ -429,6 +429,7 @@
         <div class="stat-box"><div class="stat-val" id="statEpochs">25</div><div class="stat-lbl">Epochs</div></div>
       </div>
       <button class="btn btn-primary" id="trainBtn" style="width:100%;padding:11px;" disabled>🚀 Train Model</button>
+      <div id="varianceWarn" style="display:none;margin-top:10px;padding:10px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;font-size:0.78rem;color:#856404;line-height:1.5;"></div>
       <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
       <div id="trainLog">—</div>
     </div>
@@ -457,6 +458,7 @@
         <div style="font-size:0.82rem;color:#a0aec0;">Train the model first, then predict here.</div>
       </div>
       <div id="predWinner"></div>
+      <div id="whyBox" style="margin-top:8px;padding:9px 12px;background:#f7fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:0.8rem;color:#4a5568;line-height:1.6;min-height:0;display:none;"></div>
       <div class="live-row">
         <button class="btn btn-green" id="predictImgBtn" disabled>🔍 Predict Image</button>
         <button class="btn btn-primary" id="startLiveBtn" disabled>▶ Start Live</button>
@@ -496,7 +498,7 @@
         <div class="ins-panel" id="ins-p1">
           <div class="ins-label">① Raw Frame</div>
           <canvas class="ins-canvas" id="ins-raw-canvas" width="112" height="112"></canvas>
-          <div class="ins-sub">Webcam feed<br>any resolution</div>
+          <div class="ins-sub">Webcam feed<br><span style="color:#f56565;">red = AI attention</span></div>
         </div>
 
         <!-- Panel 2: 224×224 resize -->

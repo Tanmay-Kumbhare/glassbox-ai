@@ -89,6 +89,7 @@ async function loadMobileNet() {
   setStatus('⏳ Loading MobileNet… first load may take ~10 seconds.');
   try {
     mobilenetModel = await mobilenet.load();
+    buildSpatialModel();   // ← pre-build GradCAM sub-model once
     pipeEls.load.classList.replace('active','done');
     setStatus('✅ MobileNet ready. Collect samples for each class to get started.', 'ready');
     addClassBtn.disabled = false;
@@ -278,6 +279,7 @@ trainBtn.addEventListener('click', async () => {
   setPipe('train');
   trainBtn.disabled = predictImgBtn.disabled = startLiveBtn.disabled = true;
   progressBar.style.width = '0%';
+  await checkSampleVariance();   // ← warn if samples are too similar
 
   // Reset charts
   resetTrainingCharts();
@@ -309,6 +311,7 @@ trainBtn.addEventListener('click', async () => {
     });
 
     modelTrained = true;
+    await computeClassMeans();   // ← build mean vectors for "Why" box
     setPipe('predict');
     setStatus('🎉 Training complete! Predict an image or start live prediction.', 'ready');
     trainLog.textContent   = '✅ Model trained successfully!';
@@ -325,7 +328,25 @@ trainBtn.addEventListener('click', async () => {
   }
 });
 
-// ── Prediction bars ───────────────────────────────────────────
+// ── Class mean embeddings (computed after training for "Why" box) ─
+let classMeans = [];   // Float32Array per class, filled after training
+
+async function computeClassMeans() {
+  classMeans = [];
+  for (const cls of classes) {
+    if (!cls.embeddings.length) { classMeans.push(null); continue; }
+    const stacked = tf.stack(cls.embeddings);
+    const mean    = tf.mean(stacked, 0);
+    classMeans.push(await mean.data());
+    stacked.dispose(); mean.dispose();
+  }
+}
+
+function cosineSim(a, b) {
+  let dot=0, mA=0, mB=0;
+  for (let i=0; i<a.length; i++) { dot+=a[i]*b[i]; mA+=a[i]*a[i]; mB+=b[i]*b[i]; }
+  return dot / (Math.sqrt(mA) * Math.sqrt(mB) || 1);
+}
 function renderPredBars() {
   if (!classes.length) { predBars.innerHTML = '<div style="font-size:0.82rem;color:#a0aec0;">Train the model first, then predict here.</div>'; return; }
   predBars.innerHTML = '';
@@ -348,7 +369,7 @@ function renderPredBars() {
   });
 }
 
-function showPrediction(probs) {
+function showPrediction(probs, currentEmbData) {
   classes.forEach((cls, i) => {
     const pct = (probs[i]*100).toFixed(1);
     const pe  = document.getElementById(`pct-${cls.id}`);
@@ -364,6 +385,62 @@ function showPrediction(probs) {
     predWinner.style.background = winner.pal.bg;
     predWinner.style.color      = winner.pal.text;
     predWinner.style.border     = `1.5px solid ${winner.pal.border}`;
+  }
+  // Update "Why" explanation if we have current embedding data
+  if (currentEmbData) updateWhyBox(probs, currentEmbData, maxI);
+}
+
+// ── "Why" explanation box ─────────────────────────────────────
+function updateWhyBox(probs, embData, winnerIdx) {
+  const box = document.getElementById('whyBox');
+  if (!box) return;
+  if (!classMeans.length || !classMeans[winnerIdx]) { box.textContent = ''; return; }
+
+  const winner     = classes[winnerIdx];
+  const confidence = probs[winnerIdx] * 100;
+
+  // Cosine similarity of current embedding vs each class mean
+  const sims = classMeans.map((m, i) => m ? cosineSim(embData, m) : 0);
+  const winSim = (sims[winnerIdx] * 100).toFixed(0);
+
+  // Find second best class
+  const sorted = probs.map((p,i) => ({p,i})).sort((a,b) => b.p - a.p);
+  const second = sorted[1];
+
+  let msg = '';
+  if (confidence > 90) {
+    msg = `✅ Very confident — your input is <b>${winSim}% similar</b> to the "${winner.name}" training samples.`;
+  } else if (confidence > 65) {
+    const secondName = classes[second.i]?.name || '';
+    msg = `🟡 Moderately confident — leaning toward "${winner.name}" but ${(second.p*100).toFixed(0)}% chance it's "${secondName}". Try moving closer or changing the angle.`;
+  } else {
+    msg = `⚠️ Uncertain — the input doesn't clearly match either class. The model sees it as <b>between clusters</b>. Add more varied training samples.`;
+  }
+  box.innerHTML = msg;
+}
+
+// ── Pre-training sample variance warning ──────────────────────
+async function checkSampleVariance() {
+  const warnEl = document.getElementById('varianceWarn');
+  if (!warnEl) return;
+  const warnings = [];
+  for (const cls of classes) {
+    if (cls.embeddings.length < 3) continue;
+    // Stack all embeddings and compute std dev across samples
+    const stacked = tf.stack(cls.embeddings);           // [N, 1024]
+    const mean    = tf.mean(stacked, 0, true);           // [1, 1024]
+    const diff    = stacked.sub(mean);
+    const variance = tf.mean(tf.square(diff)).arraySync();
+    stacked.dispose(); mean.dispose(); diff.dispose();
+    if (variance < 0.005) {
+      warnings.push(`"${cls.name}" (samples look very similar — add more variety)`);
+    }
+  }
+  if (warnings.length) {
+    warnEl.innerHTML = `⚠️ Low variety detected in: ${warnings.join(', ')}. Try different angles, distances, or lighting.`;
+    warnEl.style.display = 'block';
+  } else {
+    warnEl.style.display = 'none';
   }
 }
 
@@ -461,6 +538,8 @@ startLiveBtn.addEventListener('click', () => {
   stopLiveBtn.disabled  = false;
   startLiveBtn.disabled = true;
   predWinner.style.display = 'block';
+  const whyBox = document.getElementById('whyBox');
+  if (whyBox) whyBox.style.display = 'block';
   setStatus('🔴 Live prediction running…', 'ready');
   initTimelineChart();
   inspectorActivate();   // ← light up inspector panels
@@ -470,11 +549,12 @@ startLiveBtn.addEventListener('click', () => {
     const emb  = extractEmbedding(webcamEl);
     const pred = classifier.predict(emb);
     const p    = await pred.data();
+    const embData = await emb.data();   // read before dispose for why-box
     emb.dispose(); pred.dispose();
-    showPrediction(p);
+    showPrediction(p, embData);
     pushTimeline(p);
-    await runInspector(p);   // ← draw all 5 panels
-  }, 200); // 5fps — smooth but not heavy
+    await runInspector(p);
+  }, 200);
 });
 
 stopLiveBtn.addEventListener('click', stopLive);
@@ -494,6 +574,8 @@ resetBtn.addEventListener('click', () => {
   modelTrained = false;
   preview.style.display = 'none'; preview.src = '';
   predWinner.style.display = 'none';
+  const whyBox = document.getElementById('whyBox');
+  if (whyBox) { whyBox.style.display = 'none'; whyBox.textContent = ''; }
   progressBar.style.width = '0%';
   trainLog.textContent = '—';
   predictImgBtn.disabled = startLiveBtn.disabled = true;
@@ -804,67 +886,84 @@ const offCanvas = document.createElement('canvas');
 offCanvas.width = offCanvas.height = 224;
 const offCtx = offCanvas.getContext('2d');
 
+// ── Spatial sub-model for GradCAM (built once after MobileNet loads) ──
+let spatialModel = null;   // outputs [1,7,7,1024] last conv feature map
+
+function buildSpatialModel() {
+  try {
+    const base       = mobilenetModel.model;
+    if (!base || !base.layers) return;
+    // Find last conv layer before global avg pool — conv_pw_13_relu in MobileNet v1
+    const layerNames = base.layers.map(l => l.name);
+    const targetName = layerNames.find(n =>
+      n.includes('conv_pw_13_relu') || n.includes('conv_pw_13')
+    ) || layerNames.find(n => n.includes('conv_pw_') && !n.includes('conv_pw_1_'));
+    if (!targetName) return;
+    spatialModel = tf.model({
+      inputs:  base.inputs,
+      outputs: base.getLayer(targetName).output
+    });
+  } catch(e) { spatialModel = null; }
+}
+
 async function runInspector(softmaxProbs) {
   if (!webcamEl.videoWidth || !webcamEl.videoHeight) return;
 
-  // ── Panel 1: Raw frame ──────────────────────────────────────
+  // ── Panel 1: Raw frame (always drawn first, immediately) ────
   insRawCtx.drawImage(webcamEl, 0, 0, insRawCanvas.width, insRawCanvas.height);
 
-  // ── Panels 2–4: Manual tensor management ───────────────────
-  // IMPORTANT: tf.tidy() cannot wrap async/await — tensors get
-  // disposed before awaited Promises resolve. We manage manually.
-
-  let raw, resized, resized255, normalized, batched, normBatch, embedding;
+  let raw, resized, resized255, normalized, batched, normBatch, embedding, spatial;
 
   try {
-    // Step A — fromPixels: [H, W, 3] uint8
-    raw = tf.browser.fromPixels(webcamEl);
-
-    // Step B — resize to 224×224 float32
-    resized = tf.image.resizeBilinear(raw, [224, 224]);
+    // ── fromPixels → resize ─────────────────────────────────
+    raw     = tf.browser.fromPixels(webcamEl);               // [H,W,3] uint8
+    resized = tf.image.resizeBilinear(raw, [224, 224]);      // [224,224,3] float
     raw.dispose();
 
-    // ── Panel 2: Resized image ──────────────────────────────
-    // toPixels needs int32 in 0-255 range
+    // ── Panel 2: Resized 224×224 ────────────────────────────
     resized255 = resized.clipByValue(0, 255).cast('int32');
-    await tf.browser.toPixels(resized255, offCanvas);   // draws into offCanvas
+    await tf.browser.toPixels(resized255, offCanvas);        // offCanvas = 224×224
     resized255.dispose();
-    drawResizedPanel(offCanvas);                         // copy offCanvas → display
+    insResizeCtx.drawImage(offCanvas, 0, 0,
+      insResizeCanvas.width, insResizeCanvas.height);
+
+    // ── Normalise once, reuse for panels 3, 4, GradCAM ──────
+    batched   = resized.expandDims(0);                       // [1,224,224,3]
+    normBatch = batched.div(127.5).sub(1.0);                 // [-1,+1]
+    batched.dispose();
+    resized.dispose();
 
     // ── Panel 3: Normalised heatmap ─────────────────────────
-    // pixel / 127.5 - 1  →  [-1, +1]
-    normalized = resized.div(127.5).sub(1.0);
-    const normData = await normalized.data();            // Float32Array [224*224*3]
+    normalized      = normBatch.squeeze([0]);                // [224,224,3]
+    const normData  = await normalized.data();               // Float32 [224*224*3]
     normalized.dispose();
     drawNormPanel(normData);
 
     // ── Panel 4: Embedding sparkline ────────────────────────
-    // Run MobileNet on the normalised [1,224,224,3] batch
-    batched   = resized.expandDims(0);                  // [1,224,224,3]
-    normBatch = batched.div(127.5).sub(1.0);
-    batched.dispose();
-    embedding = mobilenetModel.infer(normBatch, true);   // [1,1024]
-    normBatch.dispose();
-    resized.dispose();
-    const embData = await embedding.data();              // Float32Array [1024]
+    embedding       = mobilenetModel.infer(normBatch, true); // [1,1024]
+    const embData   = await embedding.data();
     embedding.dispose();
     drawEmbeddingPanel(embData);
 
+    // ── GradCAM-lite: spatial feature map ───────────────────
+    if (spatialModel) {
+      spatial           = spatialModel.predict(normBatch);   // [1,7,7,1024]
+      const spatData    = await spatial.data();              // Float32 [7*7*1024]
+      const [,fH,fW,fC] = spatial.shape;
+      spatial.dispose();
+      drawGradCAMOverlay(spatData, fH, fW, fC);
+    }
+
+    normBatch.dispose();
+
   } catch(e) {
-    // Clean up any tensors that may still be alive on error
-    [raw,resized,resized255,normalized,batched,normBatch,embedding]
-      .forEach(t => { try { if(t) t.dispose(); } catch(_){} });
+    [raw,resized,resized255,normalized,batched,normBatch,embedding,spatial]
+      .forEach(t => { try { if (t && !t.isDisposed) t.dispose(); } catch(_){} });
     return;
   }
 
-  // ── Panel 5: Softmax bars ─────────────────────────────────
+  // ── Panel 5: Softmax bars ───────────────────────────────────
   drawSoftmaxPanel(softmaxProbs);
-}
-
-// ── Panel 2 renderer ─────────────────────────────────────────
-function drawResizedPanel(srcCanvas) {
-  // srcCanvas is the 224×224 offscreen canvas
-  insResizeCtx.drawImage(srcCanvas, 0, 0, insResizeCanvas.width, insResizeCanvas.height);
 }
 
 // ── Panel 3 renderer ─────────────────────────────────────────
@@ -909,48 +1008,89 @@ function drawNormPanel(normData) {
 }
 
 // ── Panel 4 renderer ─────────────────────────────────────────
-// Draws all 1024 embedding values as a sparkline of tiny bars.
-// Uses fillRect in a tight loop — ~1ms total.
+// Draws 1024 embedding values as a filled sparkline polyline.
+// Key fix: values are always positive (ReLU output from MobileNet),
+// so we normalise against max, not assume a -1..+1 range.
 function drawEmbeddingPanel(embData) {
   const W = insEmbedCanvas.width;    // 224
   const H = insEmbedCanvas.height;   // 112
+
   insEmbedCtx.clearRect(0, 0, W, H);
 
   // Background
   insEmbedCtx.fillStyle = '#f7fafc';
   insEmbedCtx.fillRect(0, 0, W, H);
 
-  // Baseline
-  insEmbedCtx.strokeStyle = '#e2e8f0';
-  insEmbedCtx.lineWidth   = 1;
-  insEmbedCtx.beginPath();
-  insEmbedCtx.moveTo(0, H/2); insEmbedCtx.lineTo(W, H/2);
-  insEmbedCtx.stroke();
+  // Find true max across all 1024 values
+  let maxVal = 0;
+  for (let i = 0; i < embData.length; i++) {
+    if (embData[i] > maxVal) maxVal = embData[i];
+  }
+  if (maxVal === 0) {
+    // Guard: nothing to draw
+    insEmbedCtx.fillStyle = '#a0aec0';
+    insEmbedCtx.font = '9px Segoe UI';
+    insEmbedCtx.fillText('No activation', 6, H/2);
+    return;
+  }
 
-  const n      = embData.length;   // 1024
-  const barW   = W / n;            // ~0.22px — draws as sub-pixel lines
-  const maxVal = Math.max(...embData);
+  const n    = embData.length;  // 1024
+  const padB = 4;               // bottom padding px
+
+  // Draw as filled area polyline for visibility
+  insEmbedCtx.beginPath();
+  insEmbedCtx.moveTo(0, H - padB);
 
   for (let i = 0; i < n; i++) {
-    const v    = embData[i];
-    const norm = v / (maxVal || 1);     // 0..1
-    const barH = norm * (H - 4);
-    const x    = i * barW;
-    const y    = H - barH - 2;
-
-    // Colour: low activation = grey, high = purple (brand colour)
-    const intensity = Math.round(norm * 255);
-    insEmbedCtx.fillStyle = `rgb(${102 + Math.round((1-norm)*100)}, ${126 + Math.round((1-norm)*50)}, ${234})`;
-    insEmbedCtx.globalAlpha = 0.4 + norm * 0.6;
-    insEmbedCtx.fillRect(x, y, Math.max(barW, 0.5), barH);
+    const x    = (i / (n - 1)) * W;
+    const norm = embData[i] / maxVal;          // 0..1
+    const y    = H - padB - norm * (H - padB - 4);
+    if (i === 0) insEmbedCtx.lineTo(x, y);
+    else         insEmbedCtx.lineTo(x, y);
   }
-  insEmbedCtx.globalAlpha = 1;
 
-  // Overlay: label the highest activation index
-  const maxIdx = Array.from(embData).indexOf(maxVal);
-  insEmbedCtx.fillStyle   = '#4a5568';
-  insEmbedCtx.font        = '9px Segoe UI';
-  insEmbedCtx.fillText(`peak: f${maxIdx} = ${maxVal.toFixed(2)}`, 4, 10);
+  insEmbedCtx.lineTo(W, H - padB);
+  insEmbedCtx.closePath();
+
+  // Gradient fill — purple at top, light at bottom
+  const grad = insEmbedCtx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0,   'rgba(102,126,234,0.85)');
+  grad.addColorStop(1,   'rgba(102,126,234,0.08)');
+  insEmbedCtx.fillStyle = grad;
+  insEmbedCtx.fill();
+
+  // Stroke line on top
+  insEmbedCtx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x    = (i / (n - 1)) * W;
+    const norm = embData[i] / maxVal;
+    const y    = H - padB - norm * (H - padB - 4);
+    if (i === 0) insEmbedCtx.moveTo(x, y);
+    else         insEmbedCtx.lineTo(x, y);
+  }
+  insEmbedCtx.strokeStyle = '#667eea';
+  insEmbedCtx.lineWidth   = 1.2;
+  insEmbedCtx.stroke();
+
+  // Find peak index and label it
+  let maxIdx = 0;
+  for (let i = 0; i < n; i++) { if (embData[i] > embData[maxIdx]) maxIdx = i; }
+
+  const peakX  = (maxIdx / (n - 1)) * W;
+  const peakNorm = embData[maxIdx] / maxVal;
+  const peakY  = H - padB - peakNorm * (H - padB - 4);
+
+  // Dot at peak
+  insEmbedCtx.beginPath();
+  insEmbedCtx.arc(peakX, peakY, 3, 0, Math.PI * 2);
+  insEmbedCtx.fillStyle = '#f56565';
+  insEmbedCtx.fill();
+
+  // Label — flip to left side if near right edge
+  insEmbedCtx.fillStyle = '#4a5568';
+  insEmbedCtx.font      = 'bold 8px Segoe UI';
+  const labelX = peakX > W - 60 ? peakX - 58 : peakX + 4;
+  insEmbedCtx.fillText(`peak f${maxIdx} = ${maxVal.toFixed(2)}`, labelX, Math.max(peakY - 3, 10));
 }
 
 // ── Panel 5 renderer ─────────────────────────────────────────
@@ -997,4 +1137,103 @@ function drawSoftmaxPanel(probs) {
       8, y + barH * 0.68
     );
   });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GradCAM-lite: Spatial Attention Overlay on Panel 1
+//
+//  HOW IT WORKS:
+//  MobileNet's last conv layer (conv_pw_13_relu) outputs a
+//  [1, 7, 7, 1024] tensor — a 7×7 grid of 1024-channel activations.
+//  Each cell in the 7×7 grid corresponds to a ~32×32px region of
+//  the original 224×224 image.
+//
+//  We compute the MEAN across all 1024 channels per spatial cell
+//  → produces a 7×7 "importance map"
+//  → ReLU to keep only positive activations
+//  → normalise 0..1
+//  → bilinear upsample to panel size (112×112)
+//  → draw as a semi-transparent jet colormap on top of Panel 1
+//
+//  Result: bright red = regions MobileNet activated most strongly.
+// ═══════════════════════════════════════════════════════════════
+
+// Jet colormap: maps 0..1 → [r,g,b] like MATLAB's jet
+function jetColor(t) {
+  // piecewise linear jet: blue→cyan→green→yellow→red
+  const r = Math.round(255 * Math.min(Math.max(1.5 - Math.abs(4*t - 3), 0), 1));
+  const g = Math.round(255 * Math.min(Math.max(1.5 - Math.abs(4*t - 2), 0), 1));
+  const b = Math.round(255 * Math.min(Math.max(1.5 - Math.abs(4*t - 1), 0), 1));
+  return [r, g, b];
+}
+
+// Off-screen canvas for GradCAM upsampling
+const gradCanvas = document.createElement('canvas');
+const gradCtx    = gradCanvas.getContext('2d');
+
+function drawGradCAMOverlay(spatData, fH, fW, fC) {
+  // Step 1: channel-mean per spatial cell → [fH, fW]
+  const heatmap = new Float32Array(fH * fW);
+  for (let row = 0; row < fH; row++) {
+    for (let col = 0; col < fW; col++) {
+      let sum = 0;
+      const base = (row * fW + col) * fC;
+      for (let c = 0; c < fC; c++) sum += Math.max(0, spatData[base + c]); // ReLU
+      heatmap[row * fW + col] = sum / fC;
+    }
+  }
+
+  // Step 2: normalise 0..1
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < heatmap.length; i++) {
+    if (heatmap[i] < mn) mn = heatmap[i];
+    if (heatmap[i] > mx) mx = heatmap[i];
+  }
+  const range = mx - mn || 1;
+  for (let i = 0; i < heatmap.length; i++) heatmap[i] = (heatmap[i] - mn) / range;
+
+  // Step 3: draw low-res heatmap into gradCanvas at fH×fW
+  gradCanvas.width  = fW;
+  gradCanvas.height = fH;
+  const imgData = gradCtx.createImageData(fW, fH);
+  for (let i = 0; i < fH * fW; i++) {
+    const [r,g,b] = jetColor(heatmap[i]);
+    imgData.data[i*4]   = r;
+    imgData.data[i*4+1] = g;
+    imgData.data[i*4+2] = b;
+    imgData.data[i*4+3] = Math.round(heatmap[i] * 180 + 20); // alpha: 20-200
+  }
+  gradCtx.putImageData(imgData, 0, 0);
+
+  // Step 4: draw Panel 1 raw frame first, then overlay upsampled heatmap
+  // (Panel 1 was already drawn — we composite on top)
+  insRawCtx.save();
+  insRawCtx.globalAlpha       = 0.52;
+  insRawCtx.imageSmoothingEnabled = true;
+  insRawCtx.imageSmoothingQuality = 'high';
+  insRawCtx.drawImage(gradCanvas, 0, 0,
+    insRawCanvas.width, insRawCanvas.height);
+  insRawCtx.restore();
+
+  // Step 5: legend strip at bottom — "🔴 = AI attention"
+  const lW = insRawCanvas.width;
+  const lH = 14;
+  const lY  = insRawCanvas.height - lH;
+  // gradient legend bar
+  const lg = insRawCtx.createLinearGradient(0, 0, lW, 0);
+  lg.addColorStop(0,   '#0000ff');
+  lg.addColorStop(0.25,'#00ffff');
+  lg.addColorStop(0.5, '#00ff00');
+  lg.addColorStop(0.75,'#ffff00');
+  lg.addColorStop(1,   '#ff0000');
+  insRawCtx.fillStyle = 'rgba(0,0,0,0.55)';
+  insRawCtx.fillRect(0, lY, lW, lH);
+  insRawCtx.fillStyle = lg;
+  insRawCtx.fillRect(4, lY + 3, lW - 8, lH - 6);
+  insRawCtx.fillStyle = 'white';
+  insRawCtx.font      = 'bold 7px Segoe UI';
+  insRawCtx.fillText('low attention', 5, lY + lH - 3);
+  insRawCtx.textAlign = 'right';
+  insRawCtx.fillText('high attention', lW - 4, lY + lH - 3);
+  insRawCtx.textAlign = 'left';
 }
