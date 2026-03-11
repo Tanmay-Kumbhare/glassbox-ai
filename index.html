@@ -354,6 +354,88 @@
       font-size: 0.82rem; color: #a0aec0;
     }
 
+    /* ── Epoch Replay Slider ──────────────────────────────── */
+    #replay-card {
+      background: white; border-radius: 14px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+      display: none;  /* shown after training */
+    }
+    #replay-card h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 4px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .replay-subtitle {
+      font-size: 0.78rem; color: #718096; margin-bottom: 14px;
+    }
+
+    /* image picker row */
+    .replay-source-row {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 14px; flex-wrap: wrap;
+    }
+    #replayThumb {
+      width: 56px; height: 56px; border-radius: 8px;
+      object-fit: cover; border: 2px solid #e2e8f0;
+      display: none;
+    }
+    .replay-source-info {
+      font-size: 0.78rem; color: #718096; flex: 1;
+    }
+    .replay-source-info b { color: #4a5568; }
+
+    /* slider section */
+    .replay-slider-row {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+    }
+    .epoch-label {
+      font-family: monospace; font-size: 0.82rem;
+      color: #667eea; font-weight: 700; white-space: nowrap; min-width: 60px;
+    }
+    #epochSlider {
+      flex: 1; -webkit-appearance: none; appearance: none;
+      height: 6px; border-radius: 3px;
+      background: linear-gradient(90deg, #667eea var(--pct,0%), #e2e8f0 var(--pct,0%));
+      outline: none; cursor: pointer;
+    }
+    #epochSlider::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 18px; height: 18px;
+      border-radius: 50%; background: #667eea;
+      border: 2px solid white; box-shadow: 0 1px 6px rgba(102,126,234,0.5);
+      cursor: pointer;
+    }
+    #epochSlider::-moz-range-thumb {
+      width: 18px; height: 18px; border-radius: 50%;
+      background: #667eea; border: 2px solid white; cursor: pointer;
+    }
+
+    /* replay play button */
+    .replay-controls { display: flex; gap: 8px; margin-bottom: 14px; }
+
+    /* prediction bars inside replay */
+    .replay-bars { display: flex; flex-direction: column; gap: 6px; }
+    .rbar-row { }
+    .rbar-hdr {
+      display: flex; justify-content: space-between;
+      font-size: 0.8rem; font-weight: 600; margin-bottom: 3px;
+    }
+    .rbar-track {
+      background: #e2e8f0; border-radius: 5px; height: 10px; overflow: hidden;
+    }
+    .rbar-fill {
+      height: 100%; border-radius: 5px;
+      transition: width 0.25s ease; width: 0%;
+    }
+
+    /* epoch insight box */
+    #replayInsight {
+      margin-top: 12px; padding: 10px 12px;
+      background: #f7fafc; border: 1px solid #e2e8f0;
+      border-radius: 8px; font-size: 0.8rem; color: #4a5568;
+      line-height: 1.6; min-height: 36px;
+    }
+
     /* ── Responsive ───────────────────────────────────────── */
     @media(max-width: 860px) {
       main { grid-template-columns: 1fr; }
@@ -480,6 +562,47 @@
 
     <!-- Confidence timeline -->
     <div id="timeline-card">
+
+    <!-- Epoch Replay Slider -->
+    <div id="replay-card">
+      <h3>🎞 Epoch Replay
+        <span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— watch the model learn, epoch by epoch</span>
+      </h3>
+      <div class="replay-subtitle">
+        Scrub the slider to see how the model's prediction changed as it trained. Upload a test image or use your webcam snapshot.
+      </div>
+
+      <!-- Image source row -->
+      <div class="replay-source-row">
+        <img id="replayThumb" alt="test image"/>
+        <div class="replay-source-info" id="replaySourceInfo">
+          No test image selected. Upload an image above, then click "Use Uploaded Image".
+        </div>
+        <button class="btn btn-outline btn-sm" id="replayUseUpload" disabled>🖼 Use Uploaded Image</button>
+        <button class="btn btn-outline btn-sm" id="replaySnap" disabled>📷 Snap Webcam</button>
+      </div>
+
+      <!-- Slider row -->
+      <div class="replay-slider-row">
+        <span class="epoch-label" id="epochLabel">Epoch 1</span>
+        <input type="range" id="epochSlider" min="1" max="25" value="1" step="1" disabled/>
+        <span class="epoch-label" style="text-align:right;" id="epochEndLabel">/ 25</span>
+      </div>
+
+      <!-- Play controls -->
+      <div class="replay-controls">
+        <button class="btn btn-primary btn-sm" id="replayPlayBtn" disabled>▶ Auto-Play</button>
+        <button class="btn btn-stop btn-sm" id="replayStopBtn" disabled>⏹ Stop</button>
+        <button class="btn btn-outline btn-sm" id="replayResetBtn" disabled>⏮ Reset</button>
+      </div>
+
+      <!-- Prediction bars at this epoch -->
+      <div class="replay-bars" id="replayBars"></div>
+
+      <!-- Insight sentence -->
+      <div id="replayInsight">Train the model first, then select a test image to begin.</div>
+    </div>
+
       <h3>⏱ Confidence Timeline &nbsp;<span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— live prediction history</span></h3>
       <canvas id="timelineChart"></canvas>
     </div>

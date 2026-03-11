@@ -238,6 +238,7 @@ function readFile(file) {
       setPipe('collect');
       setStatus('🖼 Image loaded. Click "Add Image" under any class to label it.', 'ready');
       updateAllButtons();
+      syncReplayButtons();
     };
   };
   reader.readAsDataURL(file);
@@ -270,6 +271,15 @@ function scheduleDistanceUpdate() {
   distTimer = setTimeout(updateDistancePanel, 600);
 }
 
+// ── Epoch Replay — saved weight snapshots ────────────────────
+// We save classifier weights every epoch during training.
+// Each snapshot = array of Float32Arrays (one per weight tensor).
+// Memory: 25 epochs × ~100KB weights = ~2.5MB — totally fine.
+let epochSnapshots  = [];   // [{epoch, weights:[], loss, acc}]
+let replayTestEmb   = null; // Float32Array — embedding of test image
+let replayTestSrc   = null; // 'upload' | 'webcam'
+let replayInterval  = null;
+
 // ── Train ─────────────────────────────────────────────────────
 trainBtn.addEventListener('click', async () => {
   if (classes.length < 2) return setStatus('Need at least 2 classes.', 'error');
@@ -293,6 +303,8 @@ trainBtn.addEventListener('click', async () => {
     )
   );
 
+  epochSnapshots = [];   // clear previous run
+
   try {
     await classifier.fit(xs, ys, {
       epochs: EPOCHS,
@@ -306,6 +318,23 @@ trainBtn.addEventListener('click', async () => {
           progressBar.style.width = pct + '%';
           trainLog.textContent    = `Epoch ${epoch+1}/${EPOCHS} — Loss: ${logs.loss.toFixed(4)} | Acc: ${(acc*100).toFixed(1)}%`;
           pushTrainingCharts(epoch+1, logs.loss, acc);
+
+          // ── Save weight snapshot for epoch replay ──────────
+          // classifier.getWeights() returns tf.Tensor[]. We
+          // immediately copy each to a plain Float32Array so we
+          // hold no extra GPU tensors between epochs.
+          const snap = {
+            epoch: epoch + 1,
+            loss:  logs.loss,
+            acc:   acc,
+            weights: classifier.getWeights().map(w => {
+              const arr = w.dataSync();           // synchonous read
+              const copy = new Float32Array(arr); // detached copy
+              // w is still owned by the model — do NOT dispose
+              return { data: copy, shape: w.shape };
+            })
+          };
+          epochSnapshots.push(snap);
         }
       }
     });
@@ -318,8 +347,9 @@ trainBtn.addEventListener('click', async () => {
     trainBtn.disabled      = false;
     predictImgBtn.disabled = false;
     startLiveBtn.disabled  = false;
-    drawArchDiagram();           // refresh with actual class count
-    updateDistancePanel();       // show final class distances
+    drawArchDiagram();
+    updateDistancePanel();
+    initReplayCard();     // ← unlock epoch replay UI
   } catch(e) {
     setStatus('❌ Training failed: ' + e.message, 'error');
     trainBtn.disabled = false;
@@ -468,6 +498,7 @@ startWebcamBtn.addEventListener('click', async () => {
       setStatus('📷 Webcam ready! Click a class Webcam button to collect samples.', 'ready');
       updateAllButtons();
       renderCamCollectBtns();
+      syncReplayButtons();
     };
   } catch(e) { setStatus('❌ Camera access denied. Allow camera in browser settings.', 'error'); }
 });
@@ -569,6 +600,14 @@ function stopLive() {
 resetBtn.addEventListener('click', () => {
   if (!confirm('Reset everything? All samples and training will be lost.')) return;
   stopCollection(); stopLive();
+  stopReplayAuto();
+  epochSnapshots = [];
+  replayTestEmb  = null;
+  if (replayCard) {
+    replayCard.style.display = 'none';
+    replayBars.innerHTML = '';
+    replayInsight.textContent = 'Train the model first, then select a test image to begin.';
+  }
   classes.forEach(c => c.embeddings.forEach(t => t.dispose()));
   classes = []; nextClassId = 0;
   modelTrained = false;
@@ -1236,4 +1275,234 @@ function drawGradCAMOverlay(spatData, fH, fW, fC) {
   insRawCtx.textAlign = 'right';
   insRawCtx.fillText('high attention', lW - 4, lY + lH - 3);
   insRawCtx.textAlign = 'left';
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🎞 EPOCH REPLAY ENGINE
+//
+//  After training:
+//  1. User picks a test image (uploaded image OR webcam snap)
+//  2. We extract its 1024D embedding ONCE (MobileNet, frozen)
+//  3. Slider scrubs through epochs 1→25
+//  4. For each epoch, we RESTORE saved weights into classifier,
+//     run a single predict(embedding), show probability bars
+//  5. Auto-play animates through all epochs at 400ms/step
+//
+//  Key insight: MobileNet is frozen, so the same image always
+//  produces the same embedding. Only the classifier weights change.
+//  This means replay is instant — no image re-processing needed.
+// ═══════════════════════════════════════════════════════════════
+
+// DOM refs for replay card
+const replayCard       = document.getElementById('replay-card');
+const replayThumb      = document.getElementById('replayThumb');
+const replaySourceInfo = document.getElementById('replaySourceInfo');
+const replayUseUpload  = document.getElementById('replayUseUpload');
+const replaySnap       = document.getElementById('replaySnap');
+const epochSlider      = document.getElementById('epochSlider');
+const epochLabel       = document.getElementById('epochLabel');
+const epochEndLabel    = document.getElementById('epochEndLabel');
+const replayPlayBtn    = document.getElementById('replayPlayBtn');
+const replayStopBtn    = document.getElementById('replayStopBtn');
+const replayResetBtn   = document.getElementById('replayResetBtn');
+const replayBars       = document.getElementById('replayBars');
+const replayInsight    = document.getElementById('replayInsight');
+
+// ── Show replay card and wire up controls ─────────────────────
+function initReplayCard() {
+  if (!epochSnapshots.length) return;
+  replayCard.style.display = 'block';
+
+  // Update slider max to match actual epochs saved
+  epochSlider.max   = epochSnapshots.length;
+  epochSlider.value = 1;
+  epochEndLabel.textContent = `/ ${epochSnapshots.length}`;
+
+  // Enable source buttons
+  replayUseUpload.disabled = !(preview.src && preview.naturalWidth > 0);
+  replaySnap.disabled      = !webcamReady;
+
+  // Render empty bars for each class
+  renderReplayBars();
+  replayInsight.textContent = 'Select a test image above to start the replay.';
+}
+
+function renderReplayBars() {
+  replayBars.innerHTML = '';
+  classes.forEach(cls => {
+    const d = document.createElement('div');
+    d.className = 'rbar-row';
+    d.innerHTML = `
+      <div class="rbar-hdr">
+        <span style="display:flex;align-items:center;gap:6px;">
+          <span style="width:8px;height:8px;border-radius:50%;background:${cls.pal.color};display:inline-block;"></span>
+          ${cls.name}
+        </span>
+        <span id="rpct-${cls.id}" style="font-family:monospace;font-size:0.78rem;">—</span>
+      </div>
+      <div class="rbar-track">
+        <div class="rbar-fill" id="rbar-${cls.id}" style="background:${cls.pal.color};"></div>
+      </div>`;
+    replayBars.appendChild(d);
+  });
+}
+
+// ── Set test image from uploaded preview ──────────────────────
+replayUseUpload.addEventListener('click', async () => {
+  if (!preview.src || !preview.naturalWidth) return;
+  await setReplaySource(preview, 'uploaded image');
+  replayThumb.src = preview.src;
+});
+
+// ── Snap webcam frame as test image ──────────────────────────
+replaySnap.addEventListener('click', async () => {
+  if (!webcamReady || !webcamEl.videoWidth) return;
+  // Draw webcam frame to a temp canvas, use as source
+  const snap = document.createElement('canvas');
+  snap.width = webcamEl.videoWidth; snap.height = webcamEl.videoHeight;
+  snap.getContext('2d').drawImage(webcamEl, 0, 0);
+  replayThumb.src = snap.toDataURL('image/jpeg', 0.85);
+  await setReplaySource(snap, 'webcam snapshot');
+});
+
+async function setReplaySource(src, label) {
+  if (!mobilenetModel) return;
+  // Extract embedding once — reused for all 25 epoch replays
+  const t = tf.tidy(() => mobilenetModel.infer(src, true));  // [1,1024]
+  replayTestEmb = await t.data();   // Float32Array
+  t.dispose();
+
+  replayThumb.style.display = 'block';
+  replaySourceInfo.innerHTML = `Test image: <b>${label}</b>. Drag the slider to scrub through epochs.`;
+
+  // Enable all controls
+  epochSlider.disabled  = false;
+  replayPlayBtn.disabled = false;
+  replayResetBtn.disabled = false;
+
+  // Jump to epoch 1 immediately
+  epochSlider.value = 1;
+  await scrubToEpoch(1);
+}
+
+// ── Core: restore weights for epoch N and predict ─────────────
+async function scrubToEpoch(epochNum) {
+  if (!replayTestEmb || !epochSnapshots.length) return;
+
+  const snapIdx = Math.min(epochNum - 1, epochSnapshots.length - 1);
+  const snap    = epochSnapshots[snapIdx];
+  if (!snap) return;
+
+  // Restore saved weights into classifier
+  const tensors = snap.weights.map(w => tf.tensor(w.data, w.shape));
+  classifier.setWeights(tensors);
+  tensors.forEach(t => t.dispose());
+
+  // Run prediction on the saved embedding
+  const embTensor  = tf.tensor2d([Array.from(replayTestEmb)], [1, 1024]);
+  const predTensor = classifier.predict(embTensor);
+  const probs      = await predTensor.data();
+  embTensor.dispose(); predTensor.dispose();
+
+  // Update slider label + fill gradient
+  epochLabel.textContent = `Epoch ${snap.epoch}`;
+  const pct = ((snap.epoch / epochSnapshots.length) * 100).toFixed(0);
+  epochSlider.style.setProperty('--pct', pct + '%');
+
+  // Update bars
+  classes.forEach((cls, i) => {
+    const p = (probs[i] * 100).toFixed(1);
+    const pe = document.getElementById(`rpct-${cls.id}`);
+    const be = document.getElementById(`rbar-${cls.id}`);
+    if (pe) pe.textContent = p + '%';
+    if (be) be.style.width  = p + '%';
+  });
+
+  // Insight sentence
+  const maxI      = Array.from(probs).indexOf(Math.max(...probs));
+  const winner    = classes[maxI];
+  const conf      = (probs[maxI] * 100).toFixed(1);
+  const isEarly   = snap.epoch <= 5;
+  const isMiddle  = snap.epoch <= 15;
+  const accPct    = (snap.acc * 100).toFixed(1);
+  const lossFmt   = snap.loss.toFixed(4);
+
+  let insight = '';
+  if (isEarly) {
+    insight = `⚡ <b>Epoch ${snap.epoch} — Early training.</b> Loss is ${lossFmt}, accuracy ${accPct}%. Weights are still near random — predictions are mostly guesses.`;
+  } else if (isMiddle) {
+    insight = `📈 <b>Epoch ${snap.epoch} — Learning.</b> Loss dropping to ${lossFmt}, accuracy ${accPct}%. The model is starting to separate the classes.`;
+  } else {
+    const converged = snap.acc > 0.9;
+    insight = converged
+      ? `✅ <b>Epoch ${snap.epoch} — Converged.</b> Loss ${lossFmt}, accuracy ${accPct}%. The model confidently predicts <b>${winner?.name}</b> at ${conf}%.`
+      : `🔄 <b>Epoch ${snap.epoch} — Still learning.</b> Loss ${lossFmt}, accuracy ${accPct}%. Not fully converged yet — more samples may help.`;
+  }
+  replayInsight.innerHTML = insight;
+
+  // Restore final trained weights after scrub so live prediction still works
+  // (will be re-applied on next scrub, so no need to re-restore here)
+}
+
+// ── Slider input handler ──────────────────────────────────────
+epochSlider.addEventListener('input', async () => {
+  stopReplayAuto();
+  await scrubToEpoch(parseInt(epochSlider.value));
+});
+
+// ── Auto-play ─────────────────────────────────────────────────
+replayPlayBtn.addEventListener('click', () => {
+  if (!replayTestEmb) return;
+  stopReplayAuto();
+  let e = parseInt(epochSlider.value);
+  if (e >= epochSnapshots.length) e = 1;   // wrap around
+
+  replayPlayBtn.disabled = true;
+  replayStopBtn.disabled = false;
+
+  replayInterval = setInterval(async () => {
+    epochSlider.value = e;
+    await scrubToEpoch(e);
+    e++;
+    if (e > epochSnapshots.length) {
+      stopReplayAuto();
+      // After auto-play ends, restore final model weights
+      restoreFinalWeights();
+    }
+  }, 420);  // 420ms per epoch — smooth but watchable
+});
+
+replayStopBtn.addEventListener('click', () => {
+  stopReplayAuto();
+  restoreFinalWeights();
+});
+
+replayResetBtn.addEventListener('click', async () => {
+  stopReplayAuto();
+  epochSlider.value = 1;
+  await scrubToEpoch(1);
+});
+
+function stopReplayAuto() {
+  if (replayInterval) { clearInterval(replayInterval); replayInterval = null; }
+  replayPlayBtn.disabled = !replayTestEmb;
+  replayStopBtn.disabled = true;
+}
+
+// Restore the final epoch's weights so live prediction still works after scrubbing
+function restoreFinalWeights() {
+  if (!epochSnapshots.length) return;
+  const last    = epochSnapshots[epochSnapshots.length - 1];
+  const tensors = last.weights.map(w => tf.tensor(w.data, w.shape));
+  classifier.setWeights(tensors);
+  tensors.forEach(t => t.dispose());
+}
+
+// Keep source buttons in sync with page state
+// (called from readFile and webcam start)
+function syncReplayButtons() {
+  if (replayUseUpload)
+    replayUseUpload.disabled = !(preview.src && preview.naturalWidth > 0);
+  if (replaySnap)
+    replaySnap.disabled = !webcamReady;
 }
