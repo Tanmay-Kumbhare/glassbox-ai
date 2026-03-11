@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Teachable Machine</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────────── */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #f0f4f8;
+      color: #1a202c;
+      min-height: 100vh;
+    }
+
+    /* ── Header ───────────────────────────────────────────── */
+    header {
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: white;
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    }
+    .header-left { display: flex; align-items: center; gap: 14px; }
+    .logo {
+      width: 38px; height: 38px;
+      background: white; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 700; }
+    header p  { font-size: 0.78rem; opacity: 0.85; margin-top: 1px; }
+
+    /* ── Status bar ───────────────────────────────────────── */
+    #status-bar {
+      background: #fff3cd; border-bottom: 1px solid #ffc107;
+      padding: 8px 32px; font-size: 0.83rem; color: #856404;
+      display: flex; align-items: center; gap: 8px; min-height: 36px;
+      transition: all 0.3s;
+    }
+    #status-bar.ready { background: #d4edda; border-color: #28a745; color: #155724; }
+    #status-bar.error { background: #f8d7da; border-color: #dc3545; color: #721c24; }
+
+    /* ── Pipeline strip ───────────────────────────────────── */
+    #pipeline {
+      background: white;
+      border-bottom: 1px solid #e2e8f0;
+      padding: 10px 32px;
+      display: flex;
+      align-items: center;
+      gap: 0;
+      overflow-x: auto;
+    }
+    .p-step {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 14px; border-radius: 20px;
+      font-size: 0.75rem; font-weight: 600;
+      color: #a0aec0; transition: all 0.3s; white-space: nowrap;
+    }
+    .p-step.active { background: #ebf4ff; color: #667eea; }
+    .p-step.done   { color: #38a169; }
+    .p-arrow { color: #cbd5e0; font-size: 0.9rem; padding: 0 2px; }
+
+    /* ── Main grid ────────────────────────────────────────── */
+    main {
+      max-width: 1200px;
+      margin: 24px auto;
+      padding: 0 20px;
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 20px;
+    }
+    .left-col  { display: flex; flex-direction: column; gap: 16px; }
+    .right-col { display: flex; flex-direction: column; gap: 16px; }
+
+    /* ── Cards ────────────────────────────────────────────── */
+    .card {
+      background: white;
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    .card-title {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 14px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .card-title .step-badge {
+      background: linear-gradient(135deg,#667eea,#764ba2);
+      color: white; font-size: 0.62rem;
+      padding: 2px 8px; border-radius: 20px;
+      margin-left: auto;
+    }
+
+    /* ── Buttons ──────────────────────────────────────────── */
+    .btn {
+      display: inline-flex; align-items: center;
+      justify-content: center; gap: 6px;
+      padding: 9px 16px; border: none; border-radius: 8px;
+      font-size: 0.83rem; font-weight: 600;
+      cursor: pointer; transition: all 0.18s;
+      font-family: 'Segoe UI', sans-serif;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary {
+      background: linear-gradient(135deg,#667eea,#764ba2);
+      color: white;
+    }
+    .btn-primary:not(:disabled):hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(102,126,234,0.4);
+    }
+    .btn-outline {
+      background: transparent; color: #4a5568;
+      border: 1.5px solid #e2e8f0;
+    }
+    .btn-outline:not(:disabled):hover { border-color: #667eea; color: #667eea; }
+    .btn-green  { background: #f0fff4; color: #276749; border: 1.5px solid #c6f6d5; }
+    .btn-green:not(:disabled):hover  { background: #c6f6d5; }
+    .btn-red    { background: #fff5f5; color: #c53030; border: 1.5px solid #fed7d7; }
+    .btn-red:not(:disabled):hover    { background: #fed7d7; }
+    .btn-stop   { background: #fff5f5; color: #9b2c2c; border: 1.5px solid #feb2b2; }
+    .btn-stop:not(:disabled):hover   { background: #feb2b2; }
+    .btn-xs { padding: 4px 10px; font-size: 0.72rem; border-radius: 6px; }
+    .btn-sm { padding: 7px 13px; font-size: 0.78rem; }
+
+    /* ── Upload area ──────────────────────────────────────── */
+    .upload-area {
+      border: 2px dashed #cbd5e0; border-radius: 10px;
+      padding: 22px; text-align: center; cursor: pointer;
+      transition: all 0.2s; background: #f7fafc; margin-bottom: 12px;
+    }
+    .upload-area:hover, .upload-area.drag-over {
+      border-color: #667eea; background: #ebf4ff;
+    }
+    .upload-area .u-icon { font-size: 1.8rem; margin-bottom: 4px; }
+    .upload-area p { font-size: 0.8rem; color: #718096; }
+    #imageUpload { display: none; }
+    #preview {
+      width: 100%; max-height: 180px; object-fit: contain;
+      border-radius: 8px; display: none;
+      border: 1px solid #e2e8f0; margin-bottom: 10px;
+    }
+
+    /* ── Classes ──────────────────────────────────────────── */
+    #classes-wrap { display: flex; flex-direction: column; gap: 10px; }
+
+    .class-row {
+      border-radius: 10px; padding: 12px 14px;
+      border: 1.5px solid transparent;
+      transition: border-color 0.2s;
+    }
+    .class-row:hover { border-color: var(--cc); }
+
+    .class-row-top {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+    }
+    .cc-dot {
+      width: 9px; height: 9px; border-radius: 50%;
+      background: var(--cc); flex-shrink: 0;
+    }
+    .cc-name {
+      font-weight: 700; font-size: 0.88rem; flex: 1;
+    }
+    .cc-count {
+      font-size: 0.72rem; color: #718096;
+    }
+    .cc-count b { color: var(--cc); }
+    .class-row-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+
+    /* Add class button */
+    #addClassBtn {
+      width: 100%; border: 2px dashed #cbd5e0;
+      background: transparent; color: #a0aec0;
+      border-radius: 10px; padding: 10px;
+      font-size: 0.8rem; font-weight: 600;
+      cursor: pointer; transition: all 0.2s;
+      font-family: 'Segoe UI', sans-serif;
+      margin-top: 4px;
+    }
+    #addClassBtn:hover { border-color: #667eea; color: #667eea; }
+    #addClassBtn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* collecting pulse */
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .collecting { animation: pulse 0.8s infinite; }
+
+    /* ── Train section ────────────────────────────────────── */
+    .train-stats {
+      display: grid; grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px; margin-bottom: 14px;
+    }
+    .stat-box {
+      background: #f7fafc; border: 1px solid #e2e8f0;
+      border-radius: 8px; padding: 10px; text-align: center;
+    }
+    .stat-val { font-size: 1.1rem; font-weight: 800; color: #667eea; }
+    .stat-lbl { font-size: 0.68rem; color: #a0aec0; margin-top: 2px; }
+
+    .progress-wrap { background: #e2e8f0; border-radius: 6px; height: 6px; overflow: hidden; margin: 10px 0; }
+    .progress-bar  { height: 100%; background: linear-gradient(90deg,#667eea,#764ba2); border-radius: 6px; width: 0%; transition: width 0.3s; }
+    #trainLog { font-size: 0.78rem; color: #718096; text-align: center; min-height: 18px; }
+
+    /* ── Webcam ───────────────────────────────────────────── */
+    #webcam {
+      width: 100%; border-radius: 10px;
+      aspect-ratio: 4/3; object-fit: cover;
+      background: #1a202c; display: block;
+      border: 1px solid #e2e8f0;
+    }
+    .cam-btn-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    #collectStatus { font-size: 0.76rem; color: #718096; margin-top: 6px; min-height: 18px; }
+
+    /* ── Prediction bars ──────────────────────────────────── */
+    .pred-row { margin-bottom: 10px; }
+    .pred-hdr {
+      display: flex; justify-content: space-between;
+      font-size: 0.82rem; font-weight: 600; margin-bottom: 4px;
+    }
+    .pred-track { background: #e2e8f0; border-radius: 6px; height: 10px; overflow: hidden; }
+    .pred-fill  { height: 100%; border-radius: 6px; width: 0%; transition: width 0.35s cubic-bezier(0.4,0,0.2,1); }
+    #predWinner {
+      margin-top: 12px; padding: 10px; border-radius: 8px;
+      text-align: center; font-size: 0.95rem; font-weight: 700;
+      display: none;
+    }
+    .live-row { display: flex; gap: 8px; margin-top: 10px; }
+    .live-row .btn { flex: 1; }
+
+    /* ── Chart section ────────────────────────────────────── */
+    .charts-row {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .chart-box {
+      background: white; border-radius: 12px;
+      padding: 14px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    .chart-box h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 10px;
+    }
+    .chart-box canvas { max-height: 160px; }
+
+    /* ── Architecture diagram ─────────────────────────────── */
+    #arch-card {
+      background: white; border-radius: 14px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    #arch-card h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 14px;
+    }
+    #arch-svg { width: 100%; overflow-x: auto; }
+
+    /* ── Embedding distance ───────────────────────────────── */
+    #dist-card {
+      background: white; border-radius: 14px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    #dist-card h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 12px;
+    }
+    .dist-pairs { display: flex; flex-direction: column; gap: 10px; }
+    .dist-row-label {
+      display: flex; justify-content: space-between;
+      font-size: 0.8rem; font-weight: 600; margin-bottom: 4px;
+    }
+    .dist-track { background: #e2e8f0; border-radius: 6px; height: 10px; overflow: hidden; }
+    .dist-fill  { height: 100%; border-radius: 6px; transition: width 0.6s; }
+    .dist-note  { font-size: 0.75rem; color: #718096; margin-top: 8px; }
+    .dist-note b { color: #667eea; }
+
+    /* ── Confidence timeline ──────────────────────────────── */
+    #timeline-card {
+      background: white; border-radius: 14px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+      grid-column: 1 / -1;
+    }
+    #timeline-card h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 10px;
+    }
+    #timeline-card canvas { max-height: 140px; }
+
+    /* ── Pipeline Inspector ───────────────────────────────── */
+    #inspector-card {
+      background: white; border-radius: 14px;
+      padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    }
+    #inspector-card h3 {
+      font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      color: #a0aec0; margin-bottom: 4px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .inspector-subtitle {
+      font-size: 0.78rem; color: #718096; margin-bottom: 14px;
+    }
+    /* 5-panel strip */
+    .inspector-strip {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      align-items: start;
+    }
+    .ins-panel {
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+    }
+    .ins-arrow {
+      display: flex; align-items: center; justify-content: center;
+      color: #cbd5e0; font-size: 1.2rem;
+      padding-top: 36px; /* align with canvas midpoint */
+    }
+    .ins-label {
+      font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.06em; color: #4a5568; text-align: center;
+    }
+    .ins-sub {
+      font-size: 0.65rem; color: #a0aec0; text-align: center;
+      line-height: 1.3; min-height: 24px;
+    }
+    .ins-canvas {
+      border-radius: 6px;
+      border: 1.5px solid #e2e8f0;
+      image-rendering: pixelated;
+      width: 100%;
+      aspect-ratio: 1;
+      background: #f7fafc;
+    }
+    /* embedding sparkline — wider */
+    #ins-embed-canvas {
+      aspect-ratio: 2 / 1;
+    }
+    /* highlight active panel during prediction */
+    .ins-panel.active .ins-label { color: #667eea; }
+    .ins-panel.active .ins-canvas { border-color: #667eea; box-shadow: 0 0 0 2px #ebf4ff; }
+
+    /* inspector idle state */
+    .inspector-idle {
+      text-align: center; padding: 20px;
+      font-size: 0.82rem; color: #a0aec0;
+    }
+
+    /* ── Responsive ───────────────────────────────────────── */
+    @media(max-width: 860px) {
+      main { grid-template-columns: 1fr; }
+      .charts-row { grid-template-columns: 1fr; }
+      .inspector-strip { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="header-left">
+    <div class="logo">🧠</div>
+    <div>
+      <h1>Teachable Machine</h1>
+      <p>Train a real image classifier — right in your browser</p>
+    </div>
+  </div>
+  <button class="btn btn-red btn-sm" id="resetBtn">🔄 Reset</button>
+</header>
+
+<!-- Status -->
+<div id="status-bar">⏳ Loading MobileNet model…</div>
+
+<!-- Pipeline -->
+<div id="pipeline">
+  <div class="p-step" id="ps-load">📦 Load MobileNet</div>
+  <span class="p-arrow">›</span>
+  <div class="p-step" id="ps-collect">🖼 Collect Samples</div>
+  <span class="p-arrow">›</span>
+  <div class="p-step" id="ps-embed">🔢 Extract Embeddings</div>
+  <span class="p-arrow">›</span>
+  <div class="p-step" id="ps-train">🏋️ Train Classifier</div>
+  <span class="p-arrow">›</span>
+  <div class="p-step" id="ps-predict">🎯 Predict</div>
+</div>
+
+<main>
+  <!-- ══ LEFT COLUMN ════════════════════════════════════════ -->
+  <div class="left-col">
+
+    <!-- Upload card -->
+    <div class="card">
+      <div class="card-title">
+        🖼 Upload Image <span class="step-badge">STEP 1</span>
+      </div>
+      <div class="upload-area" id="uploadArea">
+        <div class="u-icon">📁</div>
+        <p>Click or drag &amp; drop an image</p>
+      </div>
+      <input type="file" id="imageUpload" accept="image/*"/>
+      <img id="preview" alt="preview"/>
+    </div>
+
+    <!-- Classes card -->
+    <div class="card">
+      <div class="card-title">
+        🏷 Classes <span class="step-badge">STEP 2</span>
+      </div>
+      <div id="classes-wrap"></div>
+      <button id="addClassBtn" disabled>＋ Add Class &nbsp;<span style="opacity:0.5;font-size:0.7rem">(max 5)</span></button>
+    </div>
+
+    <!-- Train card -->
+    <div class="card">
+      <div class="card-title">
+        🏋️ Train Model <span class="step-badge">STEP 3</span>
+      </div>
+      <div class="train-stats">
+        <div class="stat-box"><div class="stat-val" id="statSamples">0</div><div class="stat-lbl">Samples</div></div>
+        <div class="stat-box"><div class="stat-val" id="statClasses">0</div><div class="stat-lbl">Classes</div></div>
+        <div class="stat-box"><div class="stat-val" id="statEpochs">25</div><div class="stat-lbl">Epochs</div></div>
+      </div>
+      <button class="btn btn-primary" id="trainBtn" style="width:100%;padding:11px;" disabled>🚀 Train Model</button>
+      <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div id="trainLog">—</div>
+    </div>
+
+    <!-- Webcam card -->
+    <div class="card">
+      <div class="card-title">📷 Webcam</div>
+      <video id="webcam" autoplay playsinline></video>
+      <div class="cam-btn-row" id="camBtnRow">
+        <button class="btn btn-outline btn-sm" id="startWebcamBtn">📷 Start Camera</button>
+      </div>
+      <div id="collectStatus"></div>
+    </div>
+
+  </div>
+
+  <!-- ══ RIGHT COLUMN ══════════════════════════════════════ -->
+  <div class="right-col">
+
+    <!-- Prediction card -->
+    <div class="card">
+      <div class="card-title">
+        🎯 Prediction <span class="step-badge">STEP 4</span>
+      </div>
+      <div id="predBars">
+        <div style="font-size:0.82rem;color:#a0aec0;">Train the model first, then predict here.</div>
+      </div>
+      <div id="predWinner"></div>
+      <div class="live-row">
+        <button class="btn btn-green" id="predictImgBtn" disabled>🔍 Predict Image</button>
+        <button class="btn btn-primary" id="startLiveBtn" disabled>▶ Start Live</button>
+        <button class="btn btn-stop" id="stopLiveBtn" disabled>⏹ Stop</button>
+      </div>
+    </div>
+
+    <!-- Training charts -->
+    <div class="charts-row">
+      <div class="chart-box">
+        <h3>📉 Training Loss</h3>
+        <canvas id="lossChart"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>📈 Training Accuracy</h3>
+        <canvas id="accChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Confidence timeline -->
+    <div id="timeline-card">
+      <h3>⏱ Confidence Timeline &nbsp;<span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— live prediction history</span></h3>
+      <canvas id="timelineChart"></canvas>
+    </div>
+
+    <!-- Pipeline Inspector -->
+    <div id="inspector-card">
+      <h3>🔬 Live Pipeline Inspector
+        <span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— what the AI sees at every step</span>
+      </h3>
+      <div class="inspector-subtitle" id="inspectorSub">
+        Start Live Prediction to see every preprocessing step visualised in real time.
+      </div>
+      <div class="inspector-strip" id="inspectorStrip">
+
+        <!-- Panel 1: Raw frame -->
+        <div class="ins-panel" id="ins-p1">
+          <div class="ins-label">① Raw Frame</div>
+          <canvas class="ins-canvas" id="ins-raw-canvas" width="112" height="112"></canvas>
+          <div class="ins-sub">Webcam feed<br>any resolution</div>
+        </div>
+
+        <!-- Panel 2: 224×224 resize -->
+        <div class="ins-panel" id="ins-p2">
+          <div class="ins-label">② Resize 224×224</div>
+          <canvas class="ins-canvas" id="ins-resize-canvas" width="112" height="112"></canvas>
+          <div class="ins-sub">TF resizes to<br>224×224 px</div>
+        </div>
+
+        <!-- Panel 3: Normalised heatmap -->
+        <div class="ins-panel" id="ins-p3">
+          <div class="ins-label">③ Normalised</div>
+          <canvas class="ins-canvas" id="ins-norm-canvas" width="112" height="112"></canvas>
+          <div class="ins-sub">Pixels ÷ 127.5 − 1<br><span style="color:#667eea">blue=−1</span> → <span style="color:#f56565">red=+1</span></div>
+        </div>
+
+        <!-- Panel 4: Embedding sparkline -->
+        <div class="ins-panel" id="ins-p4">
+          <div class="ins-label">④ Embedding 1024D</div>
+          <canvas class="ins-canvas" id="ins-embed-canvas" width="224" height="112"></canvas>
+          <div class="ins-sub">MobileNet output<br>1024 feature values</div>
+        </div>
+
+        <!-- Panel 5: Softmax output -->
+        <div class="ins-panel" id="ins-p5">
+          <div class="ins-label">⑤ Softmax Output</div>
+          <canvas class="ins-canvas" id="ins-softmax-canvas" width="112" height="112"></canvas>
+          <div class="ins-sub">Your classifier<br>probability per class</div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Architecture diagram -->
+    <div id="arch-card">
+      <h3>🧱 Network Architecture &nbsp;<span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— what's inside your classifier</span></h3>
+      <div id="arch-svg"></div>
+    </div>
+
+    <!-- Embedding distance -->
+    <div id="dist-card">
+      <h3>📐 Embedding Distance &nbsp;<span style="font-size:0.68rem;color:#a0aec0;font-weight:400;text-transform:none;">— how different your classes look to the AI</span></h3>
+      <div class="dist-pairs" id="distPairs">
+        <div style="font-size:0.82rem;color:#a0aec0;">Add samples to at least 2 classes to see how separable they are.</div>
+      </div>
+      <div class="dist-note" id="distNote"></div>
+    </div>
+
+  </div>
+</main>
+
+<script src="script.js"></script>
+</body>
+</html>
