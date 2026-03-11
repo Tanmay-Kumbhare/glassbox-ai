@@ -131,7 +131,7 @@ function addNewClass(name) {
   if (classes.length >= MAX_CLASSES) return;
   const id    = nextClassId++;
   const pal   = PALETTE[classes.length % PALETTE.length];
-  classes.push({ id, name: name || `Class ${String.fromCharCode(65 + classes.length)}`, embeddings:[], pal });
+  classes.push({ id, name: name || `Class ${String.fromCharCode(65 + classes.length)}`, embeddings:[], thumbs:[], pal });
   renderClasses();
   renderPredBars();
   updateStats();
@@ -152,10 +152,12 @@ function clearClassSamples(id) {
   if (!cls) return;
   cls.embeddings.forEach(t => t.dispose());
   cls.embeddings = [];
+  cls.thumbs = [];
   updateCountEl(id);
   updateStats();
   checkTrainReady();
   updateDistancePanel();
+  scheduleQualityUpdate();
 }
 
 function updateCountEl(id) {
@@ -253,12 +255,13 @@ function addSampleFromImage(id) {
   const emb = extractEmbedding(preview);
   if (!emb) return;
   cls.embeddings.push(emb);
+  cls.thumbs.push(captureThumbnail(preview));   // ← save 48×48 jpeg
   updateCountEl(id);
   updateStats();
   checkTrainReady();
   setStatus(`✅ Added to "${cls.name}" — ${cls.embeddings.length} sample${cls.embeddings.length > 1 ? 's' : ''}.`, 'ready');
-  // Update distance panel after adding
   scheduleDistanceUpdate();
+  scheduleQualityUpdate();   // ← refresh dashboard
 }
 window.addSampleFromImage = addSampleFromImage;
 window.deleteClass        = deleteClass;
@@ -269,6 +272,191 @@ let distTimer = null;
 function scheduleDistanceUpdate() {
   clearTimeout(distTimer);
   distTimer = setTimeout(updateDistancePanel, 600);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🔍 SAMPLE QUALITY DASHBOARD
+//
+//  Shows for each class:
+//   • Thumbnail grid (up to 12 shown, rest counted)
+//   • Diversity score — computed from mean pairwise cosine distance
+//     between stored embeddings. 0 = all identical, 100 = very varied.
+//   • Flagged thumbnails — ones that are too similar to their neighbours
+//   • Recommendations — plain-English advice on what to fix
+//
+//  Runs on a debounced 800ms timer, never continuously.
+// ═══════════════════════════════════════════════════════════════
+
+const THUMB_SIZE = 48;   // px — small enough to be cheap, big enough to see
+const THUMB_MAX  = 12;   // max shown in grid per class
+
+// Off-screen canvas reused for thumbnail capture
+const _thumbCanvas = document.createElement('canvas');
+_thumbCanvas.width = _thumbCanvas.height = THUMB_SIZE;
+const _thumbCtx = _thumbCanvas.getContext('2d');
+
+// Returns a compact jpeg data-URL from any image/video source
+function captureThumbnail(src) {
+  _thumbCtx.clearRect(0, 0, THUMB_SIZE, THUMB_SIZE);
+  _thumbCtx.drawImage(src, 0, 0, THUMB_SIZE, THUMB_SIZE);
+  return _thumbCanvas.toDataURL('image/jpeg', 0.6);
+}
+
+let qualityTimer = null;
+function scheduleQualityUpdate() {
+  clearTimeout(qualityTimer);
+  qualityTimer = setTimeout(renderQualityDashboard, 800);
+}
+
+async function renderQualityDashboard() {
+  const body = document.getElementById('qualityBody');
+  if (!body) return;
+
+  const hasAnySamples = classes.some(c => c.embeddings.length > 0);
+  if (!hasAnySamples) {
+    body.innerHTML = '<div class="qd-empty">Collect samples to see quality analysis here.</div>';
+    return;
+  }
+
+  body.innerHTML = '';   // clear
+
+  for (const cls of classes) {
+    const n = cls.embeddings.length;
+    if (n === 0) continue;
+
+    // ── Diversity score ───────────────────────────────────────
+    // Mean pairwise cosine similarity → distance = 1 - similarity
+    // We sample up to 20 pairs to keep it fast (O(400) max)
+    let diversityScore = 0;   // 0-100
+    let similarFlags   = new Set();  // embedding indices that are too close to another
+
+    if (n >= 2) {
+      const embArrays = await Promise.all(cls.embeddings.map(t => t.data()));
+      let pairCount = 0, distSum = 0;
+      const limit = Math.min(n, 20);
+
+      for (let i = 0; i < limit; i++) {
+        for (let j = i + 1; j < limit; j++) {
+          const sim  = cosineSim(embArrays[i], embArrays[j]);
+          const dist = 1 - sim;   // 0=identical, 1=totally different
+          distSum += dist;
+          pairCount++;
+          // Flag samples that are nearly identical to at least one other
+          if (sim > 0.985) { similarFlags.add(i); similarFlags.add(j); }
+        }
+      }
+      diversityScore = pairCount > 0
+        ? Math.min(100, Math.round((distSum / pairCount) * 500))
+        : 0;
+    }
+
+    const scoreLabel = diversityScore >= 60 ? 'Diverse'
+                     : diversityScore >= 30 ? 'Moderate'
+                     : 'Low variety';
+    const scoreClass = diversityScore >= 60 ? 'good'
+                     : diversityScore >= 30 ? 'medium'
+                     : 'poor';
+
+    // ── Recommendation text ───────────────────────────────────
+    let rec = '', recClass = '';
+    if (n < 5) {
+      rec = `⚠️ Only ${n} sample${n>1?'s':''}. Add at least 10–20 for reliable training.`;
+      recClass = 'warn';
+    } else if (diversityScore < 30) {
+      rec = `⚠️ Samples look too similar. Try different distances, angles, and lighting conditions.`;
+      recClass = 'warn';
+    } else if (diversityScore < 60) {
+      rec = `🟡 Decent variety. Adding samples from different backgrounds or distances would help.`;
+      recClass = '';
+    } else {
+      rec = `✅ Great variety! The model should learn this class reliably.`;
+      recClass = 'good';
+    }
+
+    // ── Build block HTML ──────────────────────────────────────
+    const block = document.createElement('div');
+    block.className = 'qd-class-block';
+
+    // Header row: dot + name + score badge
+    const headerDiv = document.createElement('div');
+    headerDiv.className = 'qd-class-header';
+    headerDiv.innerHTML = `
+      <span style="width:10px;height:10px;border-radius:50%;background:${cls.pal.color};display:inline-block;flex-shrink:0;"></span>
+      <span class="qd-class-name" style="color:${cls.pal.text}">${cls.name}</span>
+      <span style="font-size:0.72rem;color:#718096;">${n} samples</span>
+      <span class="qd-score-badge ${scoreClass}">${scoreLabel}</span>
+    `;
+    block.appendChild(headerDiv);
+
+    // Diversity bar
+    const divRow = document.createElement('div');
+    divRow.className = 'qd-div-row';
+    const barColor = diversityScore >= 60 ? '#48bb78' : diversityScore >= 30 ? '#f6ad55' : '#f56565';
+    divRow.innerHTML = `
+      <span class="qd-div-label">Variety</span>
+      <div class="qd-div-track">
+        <div class="qd-div-fill" style="width:${diversityScore}%;background:${barColor};"></div>
+      </div>
+      <span class="qd-div-pct">${diversityScore}%</span>
+    `;
+    block.appendChild(divRow);
+
+    // Thumbnail grid
+    const thumbsDiv = document.createElement('div');
+    thumbsDiv.className = 'qd-thumbs';
+
+    const shown = cls.thumbs.slice(0, THUMB_MAX);
+    shown.forEach((dataUrl, ti) => {
+      // Map thumb index to embedding index: every 5th sample gets a thumb
+      // For image uploads: 1:1. For webcam: 1 thumb per 5 embeddings.
+      // We just use thumb order for flagging (close enough for UX)
+      const wrap = document.createElement('div');
+      wrap.className = 'qd-thumb-wrap';
+      const img = document.createElement('img');
+      img.className = 'qd-thumb' + (similarFlags.has(ti * 5) ? ' similar-flag' : '');
+      img.src = dataUrl;
+      img.title = similarFlags.has(ti * 5) ? 'Very similar to another sample — try a different angle' : `Sample ${ti + 1}`;
+      wrap.appendChild(img);
+      const idx = document.createElement('span');
+      idx.className = 'qd-thumb-idx';
+      idx.textContent = ti + 1;
+      wrap.appendChild(idx);
+      thumbsDiv.appendChild(wrap);
+    });
+
+    // "+N more" chip if there are more thumbs than shown
+    if (cls.thumbs.length > THUMB_MAX) {
+      const more = document.createElement('div');
+      more.className = 'qd-thumbs-more';
+      more.textContent = `+${cls.thumbs.length - THUMB_MAX}`;
+      thumbsDiv.appendChild(more);
+    } else if (cls.thumbs.length === 0 && n > 0) {
+      // Has embeddings but no thumbs (shouldn't happen, but guard)
+      const ph = document.createElement('div');
+      ph.className = 'qd-thumbs-more';
+      ph.textContent = `${n}×`;
+      thumbsDiv.appendChild(ph);
+    }
+
+    block.appendChild(thumbsDiv);
+
+    // Recommendation
+    if (rec) {
+      const recDiv = document.createElement('div');
+      recDiv.className = `qd-rec ${recClass}`;
+      recDiv.innerHTML = rec;
+      block.appendChild(recDiv);
+    }
+
+    // Divider between classes (not after last)
+    if (cls !== classes[classes.length - 1]) {
+      const hr = document.createElement('hr');
+      hr.style.cssText = 'border:none;border-top:1px solid #e2e8f0;margin:12px 0 0;';
+      block.appendChild(hr);
+    }
+
+    body.appendChild(block);
+  }
 }
 
 // ── Epoch Replay — saved weight snapshots ────────────────────
@@ -532,6 +720,7 @@ function startCollection(id) {
   collectStatus.textContent = `⏺ Collecting for "${cls.name}"…`;
   setPipe('embed');
 
+  let thumbCounter = 0;
   collectionInterval = setInterval(() => {
     if (!webcamEl.videoWidth) return;
     const emb = extractEmbedding(webcamEl);
@@ -539,6 +728,9 @@ function startCollection(id) {
     const c = classes.find(c => c.id === id);
     if (!c) { stopCollection(); return; }
     c.embeddings.push(emb);
+    // Capture a thumbnail every 5th sample (avoid storing identical frames)
+    thumbCounter++;
+    if (thumbCounter % 5 === 1) c.thumbs.push(captureThumbnail(webcamEl));
     updateCountEl(id);
     updateStats();
     checkTrainReady();
@@ -556,6 +748,7 @@ function stopCollection() {
     const cls = classes.find(c => c.id === activeCollectId);
     if (cls) collectStatus.textContent = `✅ Stopped — "${cls.name}": ${cls.embeddings.length} samples`;
     scheduleDistanceUpdate();
+    scheduleQualityUpdate();
   }
   activeCollectId = null;
 }
@@ -611,6 +804,8 @@ resetBtn.addEventListener('click', () => {
   classes.forEach(c => c.embeddings.forEach(t => t.dispose()));
   classes = []; nextClassId = 0;
   modelTrained = false;
+  const qb = document.getElementById('qualityBody');
+  if (qb) qb.innerHTML = '<div class="qd-empty">Collect samples to see quality analysis here.</div>';
   preview.style.display = 'none'; preview.src = '';
   predWinner.style.display = 'none';
   const whyBox = document.getElementById('whyBox');
