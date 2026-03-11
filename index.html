@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
+<head> 
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Teachable Machine</title>
@@ -862,7 +862,7 @@
           <div class="int-stage" id="int-stage-1">
             <div class="int-stage-label">① Early Conv</div>
             <div class="int-stage-layer" id="int-layer-1">conv_pw_1_relu</div>
-            <canvas class="int-canvas" id="int-canvas-1" width="56" height="56"></canvas>
+            <canvas class="int-canvas" id="int-canvas-1" width="80" height="80"></canvas>
             <div class="int-badge" id="int-badge-1">32ch · 112×112</div>
             <div class="int-stage-desc">Detects <b>edges</b>, corners &amp; colour gradients — the most basic features</div>
           </div>
@@ -871,7 +871,7 @@
           <div class="int-stage" id="int-stage-2">
             <div class="int-stage-label">② Mid Conv</div>
             <div class="int-stage-layer" id="int-layer-2">conv_pw_5_relu</div>
-            <canvas class="int-canvas" id="int-canvas-2" width="56" height="56"></canvas>
+            <canvas class="int-canvas" id="int-canvas-2" width="80" height="80"></canvas>
             <div class="int-badge" id="int-badge-2">128ch · 28×28</div>
             <div class="int-stage-desc">Detects <b>textures</b> — skin, fabric, patterns, surfaces</div>
           </div>
@@ -880,7 +880,7 @@
           <div class="int-stage" id="int-stage-3">
             <div class="int-stage-label">③ Deep Conv</div>
             <div class="int-stage-layer" id="int-layer-3">conv_pw_9_relu</div>
-            <canvas class="int-canvas" id="int-canvas-3" width="56" height="56"></canvas>
+            <canvas class="int-canvas" id="int-canvas-3" width="80" height="80"></canvas>
             <div class="int-badge" id="int-badge-3">256ch · 14×14</div>
             <div class="int-stage-desc">Detects <b>object parts</b> — faces, hands, wheels, edges of objects</div>
           </div>
@@ -889,7 +889,7 @@
           <div class="int-stage" id="int-stage-4">
             <div class="int-stage-label">④ Last Conv</div>
             <div class="int-stage-layer" id="int-layer-4">conv_pw_13_relu</div>
-            <canvas class="int-canvas" id="int-canvas-4" width="56" height="56"></canvas>
+            <canvas class="int-canvas" id="int-canvas-4" width="80" height="80"></canvas>
             <div class="int-badge" id="int-badge-4">1024ch · 7×7</div>
             <div class="int-stage-desc">Detects <b>whole objects</b> — collapses to the 1024D embedding via global avg pool</div>
           </div>

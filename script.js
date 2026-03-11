@@ -89,7 +89,12 @@ async function loadMobileNet() {
   setStatus('⏳ Loading MobileNet… first load may take ~10 seconds.');
   try {
     mobilenetModel = await mobilenet.load();
-    buildSpatialModel();   // ← pre-build GradCAM sub-model once
+    // Log ALL layer names so we can see exactly what this MobileNet version has
+    if (mobilenetModel.model && mobilenetModel.model.layers) {
+      console.warn('[MobileNet] layers:', mobilenetModel.model.layers.map(l => l.name).join(' | '));
+    }
+    buildSpatialModel();
+    console.warn('[MobileNet] loaded. spatialModel:', !!spatialModel, 'internalModels:', internalModels.length);
     pipeEls.load.classList.replace('active','done');
     setStatus('✅ MobileNet ready. Collect samples for each class to get started.', 'ready');
     addClassBtn.disabled = false;
@@ -770,11 +775,13 @@ startLiveBtn.addEventListener('click', () => {
 
   predInterval = setInterval(async () => {
     if (!webcamEl.videoWidth) return;
-    const emb  = extractEmbedding(webcamEl);
-    const pred = classifier.predict(emb);
-    const p    = await pred.data();
-    const embData = await emb.data();   // read before dispose for why-box
+
+    // Extract embedding + run classifier — all intermediate tensors cleaned by tidy
+    const emb  = tf.tidy(() => mobilenetModel.infer(webcamEl, true));   // [1,1024]
+    const pred = tf.tidy(() => classifier.predict(emb));
+    const [p, embData] = await Promise.all([pred.data(), emb.data()]);
     emb.dispose(); pred.dispose();
+
     showPrediction(p, embData);
     pushTimeline(p);
     await runInspector(p);
@@ -1129,21 +1136,19 @@ function buildSpatialModel() {
     const base = mobilenetModel.model;
     if (!base || !base.layers) return;
     const layerNames = base.layers.map(l => l.name);
+    console.warn('[MobileNet] all layers:', layerNames.join(', '));
 
     // ── GradCAM spatial model (last conv) ────────────────────
     const lastConvName = layerNames.find(n => n.includes('conv_pw_13_relu'))
                       || layerNames.find(n => n.includes('conv_pw_13'));
     if (lastConvName) {
       spatialModel = tf.model({ inputs: base.inputs, outputs: base.getLayer(lastConvName).output });
+      console.warn('[MobileNet] GradCAM layer:', lastConvName);
     }
 
     // ── MobileNet Internals: 4 depth stages ──────────────────
-    // We target 4 layers that represent progressively deeper processing.
-    // MobileNet v1 has 14 pointwise conv blocks (conv_pw_1 … conv_pw_13).
-    // We pick: pw_1 (very early), pw_5 (mid), pw_9 (deep), pw_13 (last).
-    // For each, fall back gracefully if the exact name isn't present.
     const stageCandidates = [
-      ['conv_pw_1_relu', 'conv_pw_1', 'conv_dw_1_relu', 'conv1_relu'],
+      ['conv_pw_1_relu', 'conv_pw_1', 'conv1_relu', 'conv_dw_1_relu', 'Conv1_relu'],
       ['conv_pw_5_relu', 'conv_pw_5', 'conv_dw_5_relu'],
       ['conv_pw_9_relu', 'conv_pw_9', 'conv_dw_9_relu'],
       ['conv_pw_13_relu','conv_pw_13','conv_dw_13_relu'],
@@ -1152,17 +1157,20 @@ function buildSpatialModel() {
     internalModels = [];
     stageCandidates.forEach((candidates, i) => {
       const found = candidates.find(c => layerNames.includes(c));
+      console.warn(`[MobileNet] stage${i+1} candidates:`, candidates, '→', found || 'NOT FOUND');
       if (!found) return;
       try {
         const m = tf.model({ inputs: base.inputs, outputs: base.getLayer(found).output });
+        const outShape = base.getLayer(found).outputShape;
+        console.warn(`[MobileNet] stage${i+1} model built, output shape:`, outShape);
         internalModels.push({ model: m, layerName: found, stageIdx: i + 1 });
-        // Update layer name label in HTML
         const lbl = document.getElementById(`int-layer-${i + 1}`);
         if (lbl) lbl.textContent = found;
-      } catch(_) {}
+      } catch(e) { console.error(`[MobileNet] stage${i+1} build failed:`, e); }
     });
 
   } catch(e) {
+    console.error('[MobileNet] buildSpatialModel failed:', e);
     spatialModel   = null;
     internalModels = [];
   }
@@ -1171,65 +1179,65 @@ function buildSpatialModel() {
 async function runInspector(softmaxProbs) {
   if (!webcamEl.videoWidth || !webcamEl.videoHeight) return;
 
-  // ── Panel 1: Raw frame (always drawn first, immediately) ────
+  // ── Panel 1: Raw frame (draw immediately, zero tensors) ────
   insRawCtx.drawImage(webcamEl, 0, 0, insRawCanvas.width, insRawCanvas.height);
 
-  let raw, resized, resized255, normalized, batched, normBatch, embedding, spatial;
+  // ── Panels 2 + 3: build pixel arrays inside tidy, read out, dispose ──
+  // tidy() cannot wrap await, so we extract all synchronous ops here
+  // and only await the canvas write outside.
+  let normData, embData, spatData, spatShape, batchedData;
+
+  // Step A: resize + get raw pixels for Panel 2
+  const resized255Data = tf.tidy(() => {
+    const raw     = tf.browser.fromPixels(webcamEl);
+    const resized = tf.image.resizeBilinear(raw, [224, 224]);
+    return resized.clipByValue(0, 255).cast('int32');
+  });
+  await tf.browser.toPixels(resized255Data, offCanvas);
+  resized255Data.dispose();
+  insResizeCtx.drawImage(offCanvas, 0, 0, insResizeCanvas.width, insResizeCanvas.height);
+
+  // Step B: normalise + read norm data for Panel 3
+  // Keep normBatch alive for embedding + internals, dispose after
+  const normBatch = tf.tidy(() => {
+    const raw     = tf.browser.fromPixels(webcamEl);
+    const resized = tf.image.resizeBilinear(raw, [224, 224]);
+    return resized.expandDims(0).div(127.5).sub(1.0);  // [1,224,224,3] [-1,+1]
+  });
 
   try {
-    // ── fromPixels → resize ─────────────────────────────────
-    raw     = tf.browser.fromPixels(webcamEl);               // [H,W,3] uint8
-    resized = tf.image.resizeBilinear(raw, [224, 224]);      // [224,224,3] float
-    raw.dispose();
-
-    // ── Panel 2: Resized 224×224 ────────────────────────────
-    resized255 = resized.clipByValue(0, 255).cast('int32');
-    await tf.browser.toPixels(resized255, offCanvas);        // offCanvas = 224×224
-    resized255.dispose();
-    insResizeCtx.drawImage(offCanvas, 0, 0,
-      insResizeCanvas.width, insResizeCanvas.height);
-
-    // ── Normalise once, reuse for panels 3, 4, GradCAM ──────
-    batched   = resized.expandDims(0);                       // [1,224,224,3]
-    normBatch = batched.div(127.5).sub(1.0);                 // [-1,+1]
-    batched.dispose();
-    resized.dispose();
-
-    // ── Panel 3: Normalised heatmap ─────────────────────────
-    normalized      = normBatch.squeeze([0]);                // [224,224,3]
-    const normData  = await normalized.data();               // Float32 [224*224*3]
-    normalized.dispose();
+    // Panel 3: norm heatmap
+    normData = await tf.tidy(() => normBatch.squeeze([0])).data();
     drawNormPanel(normData);
 
-    // ── Panel 4: Embedding sparkline ────────────────────────
-    embedding       = mobilenetModel.infer(normBatch, true); // [1,1024]
-    const embData   = await embedding.data();
-    embedding.dispose();
+    // Panel 4: embedding sparkline — wrap infer in tidy to clean intermediates
+    const embTensor = tf.tidy(() => mobilenetModel.infer(normBatch, true));
+    embData = await embTensor.data();
+    embTensor.dispose();
     drawEmbeddingPanel(embData);
 
-    // ── GradCAM-lite: spatial feature map ───────────────────
+    // GradCAM — wrap predict in tidy
     if (spatialModel) {
-      spatial           = spatialModel.predict(normBatch);   // [1,7,7,1024]
-      const spatData    = await spatial.data();
-      const [,fH,fW,fC] = spatial.shape;
-      spatial.dispose();
-      drawGradCAMOverlay(spatData, fH, fW, fC);
+      const spatTensor = tf.tidy(() => spatialModel.predict(normBatch));
+      spatData  = await spatTensor.data();
+      spatShape = spatTensor.shape;
+      spatTensor.dispose();
+      drawGradCAMOverlay(spatData, spatShape[1], spatShape[2], spatShape[3]);
     }
 
-    // ── MobileNet Internals: 4 depth stages ─────────────────
+    // MobileNet Internals — each sub-model predict wrapped in tidy
     if (internalsVisible && internalModels.length > 0) {
       await runInternals(normBatch);
+    } else if (internalsVisible) {
+      console.warn('[Inspector] internalsVisible=true but internalModels empty!');
     }
 
-    normBatch.dispose();
-
-  } catch(e) {
-    [raw,resized,resized255,normalized,batched,normBatch,embedding,spatial]
-      .forEach(t => { try { if (t && !t.isDisposed) t.dispose(); } catch(_){} });
-    return;
+  } finally {
+    // Always dispose normBatch — even if an error occurs
+    if (!normBatch.isDisposed) normBatch.dispose();
   }
 
-  // ── Panel 5: Softmax bars ───────────────────────────────────
+  // Panel 5: softmax bars (pure DOM, no tensors)
   drawSoftmaxPanel(softmaxProbs);
 }
 
@@ -1798,109 +1806,142 @@ function thermalColor(t) {
 }
 
 // Draw a [H,W] Float32Array as a thermal heatmap on a canvas ctx
-function drawHeatmap(ctx, canvas, heatmap, fH, fW) {
-  // Normalise
-  let mn = Infinity, mx = -Infinity;
-  for (let i = 0; i < heatmap.length; i++) {
+function drawHeatmap(canvas, heatmap, fH, fW) {
+  // Always match canvas buffer to its CSS display size
+  const size = canvas.clientWidth || 80;
+  canvas.width  = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  // Find range
+  let mn = heatmap[0], mx = heatmap[0];
+  for (let i = 1; i < heatmap.length; i++) {
     if (heatmap[i] < mn) mn = heatmap[i];
     if (heatmap[i] > mx) mx = heatmap[i];
   }
-  const range = mx - mn || 1;
+  const range = mx - mn;
 
-  const imgData = ctx.createImageData(fW, fH);
-  for (let i = 0; i < fH * fW; i++) {
-    const t = (heatmap[i] - mn) / range;
-    const [r,g,b] = thermalColor(t);
-    imgData.data[i*4]   = r;
-    imgData.data[i*4+1] = g;
-    imgData.data[i*4+2] = b;
-    imgData.data[i*4+3] = 255;
+  if (range < 1e-7) {
+    ctx.fillStyle = '#1a202c';
+    ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = 'rgba(160,174,192,0.7)';
+    ctx.font = `${Math.round(size * 0.12)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('no signal', size / 2, size / 2);
+    return;
+  }
+
+  // Write pixels directly at display resolution — upscale by nearest-neighbour
+  // Each source cell (row,col) maps to a tile of pixels in the output
+  const imgData = ctx.createImageData(size, size);
+  const scaleY  = fH / size;
+  const scaleX  = fW / size;
+
+  for (let py = 0; py < size; py++) {
+    const srcRow = Math.min(Math.floor(py * scaleY), fH - 1);
+    for (let px = 0; px < size; px++) {
+      const srcCol = Math.min(Math.floor(px * scaleX), fW - 1);
+      const t = (heatmap[srcRow * fW + srcCol] - mn) / range;
+      const [r, g, b] = thermalColor(t);
+      const idx = (py * size + px) * 4;
+      imgData.data[idx]     = r;
+      imgData.data[idx + 1] = g;
+      imgData.data[idx + 2] = b;
+      imgData.data[idx + 3] = 255;
+    }
   }
   ctx.putImageData(imgData, 0, 0);
-
-  // Upscale to display canvas using smoothing
-  // We need a temp canvas at fW×fH, then drawImage with smoothing to 56×56
-  const tmp = document.createElement('canvas');
-  tmp.width  = fW; tmp.height = fH;
-  tmp.getContext('2d').putImageData(imgData, 0, 0);
-
-  canvas.width  = 56; canvas.height = 56;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(tmp, 0, 0, 56, 56);
 }
 
-// Peak activation stat — tells the learner what to look for
-function describeActivation(heatmap, stageIdx) {
-  let sum = 0, max = 0, maxPos = 0;
+function describeActivation(heatmap) {
+  let sum = 0, max = 0;
   for (let i = 0; i < heatmap.length; i++) {
     sum += heatmap[i];
-    if (heatmap[i] > max) { max = heatmap[i]; maxPos = i; }
+    if (heatmap[i] > max) max = heatmap[i];
   }
   const mean   = sum / heatmap.length;
-  const spread = (max > 0 ? mean / max : 0);  // low = sparse activation, high = diffuse
-
-  if (spread < 0.2) return 'sparse — a few specific regions activated strongly';
-  if (spread < 0.5) return 'focused — moderate regions activated';
-  return 'diffuse — the whole image is activating this layer';
+  const spread = max > 0 ? mean / max : 0;
+  if (spread < 0.2) return 'sparse — a few regions activated strongly';
+  if (spread < 0.5) return 'focused — moderate activation across regions';
+  return 'diffuse — whole image activating this layer';
 }
 
 async function runInternals(normBatch) {
-  // normBatch is [1,224,224,3] already computed in runInspector
-  // We predict through each of the 4 stage models in sequence
+  console.warn('[Internals] runInternals called, models:', internalModels.length, 'normBatch disposed:', normBatch.isDisposed);
   const stats = [];
+  const isFirst = !runInternals._ran;
+  runInternals._ran = true;
+
+  // ── FIRST-RUN SELF-TEST: draw a known gradient to canvas 1 ──
+  // If this shows colour, drawHeatmap works. If black, CSS/canvas issue.
+  if (isFirst) {
+    const testCanvas = intCanvases[0];
+    if (testCanvas) {
+      const testHeat = new Float32Array(7 * 7);
+      for (let i = 0; i < 49; i++) testHeat[i] = i / 48;
+      console.warn('[Internals] drawing test gradient to canvas 1...');
+      drawHeatmap(testCanvas, testHeat, 7, 7);
+      console.warn('[Internals] test gradient drawn. Canvas size:', testCanvas.width, testCanvas.height, 'clientW:', testCanvas.clientWidth);
+    }
+  }
 
   for (let s = 0; s < internalModels.length; s++) {
     const { model, layerName, stageIdx } = internalModels[s];
-    const ctx    = intCtxs[stageIdx - 1];
     const canvas = intCanvases[stageIdx - 1];
-    if (!ctx || !canvas) continue;
+    if (!canvas) continue;
 
-    let feat;
     try {
-      feat = model.predict(normBatch);       // [1, H, W, C]
-      const data     = await feat.data();    // Float32Array [H*W*C]
-      const [, fH, fW, fC] = feat.shape;
-      feat.dispose();
+      // Do NOT use tf.tidy here — it can interfere with tensors from outside scope
+      const featTensor = model.predict(normBatch);
+      const [, fH, fW, fC] = featTensor.shape;
 
-      // Update badge: channels × spatial
+      const data = await featTensor.data();
+      featTensor.dispose();
+
       if (intBadges[stageIdx - 1]) {
         intBadges[stageIdx - 1].textContent = `${fC}ch · ${fH}×${fW}`;
       }
 
-      // Channel-mean: sum across C channels per spatial cell
+      // Log raw values on first run
+      if (isFirst) {
+        const s5 = Array.from(data.slice(0, 5)).map(v => v.toFixed(5));
+        let lo = data[0], hi = data[0];
+        for (const v of data) { if (v < lo) lo = v; if (v > hi) hi = v; }
+        console.warn(`[Internals] stage${stageIdx} ${layerName} shape=[${fH},${fW},${fC}] range=[${lo.toFixed(5)},${hi.toFixed(5)}] first5=[${s5}]`);
+      }
+
+      // Channel-mean absolute activation — NHWC: idx = (row*fW+col)*fC + ch
       const heatmap = new Float32Array(fH * fW);
       for (let row = 0; row < fH; row++) {
         for (let col = 0; col < fW; col++) {
           let sum = 0;
           const base = (row * fW + col) * fC;
-          for (let c = 0; c < fC; c++) sum += Math.max(0, data[base + c]); // ReLU
+          for (let c = 0; c < fC; c++) sum += Math.abs(data[base + c]);
           heatmap[row * fW + col] = sum / fC;
         }
       }
 
-      drawHeatmap(ctx, canvas, heatmap, fH, fW);
+      if (isFirst) {
+        let lo = heatmap[0], hi = heatmap[0];
+        for (const v of heatmap) { if (v < lo) lo = v; if (v > hi) hi = v; }
+        console.warn(`[Internals] stage${stageIdx} heatmap range=[${lo.toFixed(6)},${hi.toFixed(6)}]`);
+      }
 
-      // Highlight active state
+      drawHeatmap(canvas, heatmap, fH, fW);
       canvas.classList.add('active-int');
-
-      stats.push({ stageIdx, fH, fW, fC, desc: describeActivation(heatmap, stageIdx), layerName });
+      stats.push({ stageIdx, fH, fW, fC, desc: describeActivation(heatmap), layerName });
 
     } catch(e) {
-      if (feat && !feat.isDisposed) feat.dispose();
+      console.error(`[Internals] stage${stageIdx} error:`, e.message);
     }
   }
 
-  // Update insight sentence
   if (stats.length > 0 && internalsInsight) {
     const s1 = stats.find(s => s.stageIdx === 1);
     const s4 = stats.find(s => s.stageIdx === 4);
-    const earlyDesc = s1 ? s1.desc : '—';
-    const deepDesc  = s4 ? s4.desc : '—';
     internalsInsight.innerHTML =
-      `🔍 <b>Early layer (${s1?.layerName || 'conv1'}):</b> ${earlyDesc}. &nbsp;` +
-      `<b>Deep layer (${s4?.layerName || 'conv13'}):</b> ${deepDesc}. ` +
-      `As depth increases the spatial resolution shrinks but the feature complexity grows — ` +
-      `from edges to objects.`;
+      `🔍 <b>Early (${s1?.layerName || 'conv1'}):</b> ${s1?.desc || '—'}. &nbsp;` +
+      `<b>Deep (${s4?.layerName || 'conv13'}):</b> ${s4?.desc || '—'}. ` +
+      `Resolution shrinks as depth grows — edges → textures → objects.`;
   }
-}
+} 
